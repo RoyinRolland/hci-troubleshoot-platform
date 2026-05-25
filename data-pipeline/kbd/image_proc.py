@@ -230,30 +230,20 @@ def _compress_image_if_needed(image_path: Path) -> tuple[bytes, str]:
 # Step 2：Vision LLM 单次调用（文字照录 + 语义描述）
 # ──────────────────────────────────────────────────────────────────────────────
 
-_VISION_PROMPT_V3 = """\
-你是HCI超融合平台故障排查文档助手。
-
-这张截图出现在一篇故障排查案例文档中，截图前的文档内容如下：
-
-【文档上下文】
-{context}
-【上下文结束】
-
-请完成以下两个任务，严格按格式输出，禁止输出其他任何内容：
-
-FULL_TEXT:
-[将截图中所有可见文字原文照录，每行一个"- "条目]
-[日志/终端截图：每条日志行单独一条，保留时间戳、级别、完整错误信息]
-[任务列表截图：每行保留状态（失败/完成/进行中）、任务名、时间，每个字段单独一条]
-[若截图中完全没有文字：- （无文字）]
-
-DESCRIPTION:
-[结合上方文档上下文，用2-4句技术语言描述：
-  ① 这张截图展示了什么内容（是什么）
-  ② 它与上下文中描述的故障现象有何关联（说明什么）
-  ③ 截图揭示了什么问题、状态或结论（得出什么）
- 不要复述上下文原文；用截图信息来解释和印证上下文；输出为连续段落，不要用列表格式]
-"""
+# Prompt 从外部文件加载，方便独立维护（见 prompt/image_proc_vision_v3.txt）
+_VISION_PROMPT_V3_PATH = Path(__file__).parent / "prompt" / "image_proc_vision_v3.txt"
+if not _VISION_PROMPT_V3_PATH.exists():
+    raise RuntimeError(
+        f"Vision prompt 文件不存在: {_VISION_PROMPT_V3_PATH}。"
+        "请确认部署/打包流程已包含 data-pipeline/kbd/prompt/ 目录，"
+        "且运行环境中的代码目录结构未发生变化。"
+    )
+try:
+    _VISION_PROMPT_V3: str = _VISION_PROMPT_V3_PATH.read_text(encoding="utf-8")
+except OSError as exc:
+    raise RuntimeError(
+        f"读取 Vision prompt 文件失败: {_VISION_PROMPT_V3_PATH}，原因: {exc}"
+    ) from exc
 
 
 async def _vision_analyze(
