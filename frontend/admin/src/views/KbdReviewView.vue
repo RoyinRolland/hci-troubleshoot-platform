@@ -18,7 +18,6 @@ interface KbdMetadata {
 interface KbdEntry {
   id: number
   support_id: string
-  support_url: string
   title: string
   content_md: string
   metadata: KbdMetadata
@@ -32,6 +31,12 @@ interface KbdEntry {
   created_at: string
   updated_at: string
   ai_category_label?: string | null
+}
+
+// 生成深信服案例原始页面 URL
+const SANGFOR_BASE_URL = 'https://support.sangfor.com.cn'
+function makeSupportUrl(supportId: string): string {
+  return `${SANGFOR_BASE_URL}/cases/list?product_id=33&type=1&category_id=${supportId}&isOpen=true`
 }
 
 interface PendingKbdResponse {
@@ -110,6 +115,8 @@ const page = ref(1)
 const pageSize = ref(20)
 const categoryFilter = ref('')
 const statusFilter = ref('draft')
+const supportIdFilter = ref('')
+const titleKeywordFilter = ref('')
 
 // 分类基线（用于 select）
 const categoriesLoading = ref(false)
@@ -160,6 +167,12 @@ async function fetchPending() {
     })
     if (categoryFilter.value) {
       params.append('category_id', categoryFilter.value)
+    }
+    if (supportIdFilter.value) {
+      params.append('support_id', supportIdFilter.value)
+    }
+    if (titleKeywordFilter.value) {
+      params.append('title_keyword', titleKeywordFilter.value)
     }
     const resp = await fetch(`/api/v1/kbd/pending?${params}`, {
       headers: authHeader,
@@ -263,6 +276,15 @@ function openDetailDialog(entry: KbdEntry) {
 
 function handlePageChange(newPage: number) {
   page.value = newPage
+  fetchPending()
+}
+
+function resetFilters() {
+  categoryFilter.value = ''
+  statusFilter.value = 'draft'
+  supportIdFilter.value = ''
+  titleKeywordFilter.value = ''
+  page.value = 1
   fetchPending()
 }
 
@@ -816,7 +838,25 @@ onMounted(() => {
     <!-- 过滤栏 -->
     <el-card class="filter-card" shadow="never">
       <el-row :gutter="16" align="middle">
-        <el-col :span="6">
+        <el-col :span="4">
+          <el-input
+            v-model="supportIdFilter"
+            placeholder="按案例 ID 精准搜索"
+            clearable
+            @clear="fetchPending"
+            @keyup.enter="fetchPending"
+          />
+        </el-col>
+        <el-col :span="5">
+          <el-input
+            v-model="titleKeywordFilter"
+            placeholder="按标题关键字搜索"
+            clearable
+            @clear="fetchPending"
+            @keyup.enter="fetchPending"
+          />
+        </el-col>
+        <el-col :span="4">
           <el-input
             v-model="categoryFilter"
             placeholder="按 AI 分类 ID 筛选（如 虚拟机-001）"
@@ -825,7 +865,7 @@ onMounted(() => {
             @keyup.enter="fetchPending"
           />
         </el-col>
-        <el-col :span="5">
+        <el-col :span="4">
           <el-select v-model="statusFilter" @change="fetchPending" style="width: 100%">
             <el-option label="待审核 (draft)" value="draft" />
             <el-option label="已发布 (published)" value="published" />
@@ -833,13 +873,13 @@ onMounted(() => {
             <el-option label="已归档 (archived)" value="archived" />
           </el-select>
         </el-col>
-        <el-col :span="4">
+        <el-col :span="3">
           <div class="filter-btn-group">
             <el-button type="primary" @click="fetchPending">搜索</el-button>
-            <el-button @click="categoryFilter = ''; statusFilter = 'draft'; fetchPending()">重置</el-button>
+            <el-button @click="resetFilters">重置</el-button>
           </div>
         </el-col>
-        <el-col :span="9" class="total-info">
+        <el-col :span="4" class="total-info">
           <span>共 <strong>{{ total }}</strong> 条</span>
         </el-col>
       </el-row>
@@ -851,7 +891,7 @@ onMounted(() => {
         <!-- 案例 ID -->
         <el-table-column label="案例 ID" width="100">
           <template #default="{ row }">
-            <a :href="row.support_url" target="_blank" class="support-link">
+            <a :href="makeSupportUrl(row.support_id)" target="_blank" class="support-link">
               {{ row.support_id }}
             </a>
           </template>
@@ -949,7 +989,7 @@ onMounted(() => {
         <!-- 基本信息 -->
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="案例 ID">
-            <a :href="detailEntry.support_url" target="_blank" class="support-link">
+            <a :href="makeSupportUrl(detailEntry.support_id)" target="_blank" class="support-link">
               {{ detailEntry.support_id }}
               <el-icon style="font-size: 11px; margin-left: 3px"><Link /></el-icon>
             </a>
