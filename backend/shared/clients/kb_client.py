@@ -364,7 +364,7 @@ class KBClient(InternalHTTPClient):
         """
         try:
             resp = await self.get(
-                f"/api/sop/{document_id}/tree",
+                f"{self._api_prefix}/sop/{document_id}/tree",
                 timeout=_REQUEST_TIMEOUT,
             )
             if resp.status_code == 404:
@@ -374,6 +374,40 @@ class KBClient(InternalHTTPClient):
         except (httpx.HTTPStatusError, httpx.RequestError) as exc:
             logger.warning(
                 event="kb_get_sop_tree_error",
+                document_id=document_id,
+                error=str(exc),
+            )
+            return None
+
+    async def get_sop_document(self, document_id: int) -> dict | None:
+        """获取 SOP 文档详情（含 variable_schema）。
+
+        调用 GET /api/admin/sop/{document_id}
+
+        Returns:
+            {
+                "id": int,
+                "title": str,
+                "variable_schema": list[dict],  # 变量定义列表
+                "tree_json": dict | None,
+                ...
+            }
+            404 时返回 None。
+        """
+        try:
+            # 使用 admin API 获取完整文档信息（含 variable_schema）
+            resp = await self._client.get(
+                f"/api/admin/sop/{document_id}",
+                headers=self._headers,
+                timeout=_REQUEST_TIMEOUT,
+            )
+            if resp.status_code == 404:
+                return None
+            resp.raise_for_status()
+            return resp.json()
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            logger.warning(
+                event="kb_get_sop_document_error",
                 document_id=document_id,
                 error=str(exc),
             )

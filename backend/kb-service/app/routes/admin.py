@@ -30,7 +30,7 @@ from sqlalchemy import select, text
 
 from app.models.document import KBDocument
 from app.models.sop_document import SopDocument
-from app.services.sop_parser import parse_sop_markdown
+from app.services.sop_parser import extract_sop_variables, merge_variable_schema, parse_sop_markdown
 
 if TYPE_CHECKING:
     from shared.database.postgres import DatabaseManager
@@ -700,6 +700,8 @@ class SopApproveResponse(BaseModel):
     tree_generated: bool = Field(..., description="是否成功生成 SOP 决策树")
     tree_leaf_count: int | None = Field(None, description="决策树叶节点数量")
     tree_validation_status: str | None = Field(None, description="决策树校验状态（valid/warnings）")
+    variable_count: int = Field(0, description="提取的变量数量（T-AGT-24）")
+    warnings: list[str] = Field(default_factory=list, description="审核警告列表（含 orphan 变量等）")
     published_at: str | None = Field(None, description="发布时间")
 
 
@@ -753,6 +755,8 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
 
             if sop_doc.status == "published":
                 # 已发布，直接返回当前 tree 信息
+                # 获取 variable_schema（若存在）
+                var_schema_raw = sop_doc.variable_schema or []
                 return SopApproveResponse(
                     success=True,
                     document_id=document_id,
@@ -761,10 +765,14 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
                     tree_generated=sop_doc.tree_json is not None,
                     tree_leaf_count=sop_doc.tree_leaf_count if sop_doc.tree_json is not None else None,
                     tree_validation_status=sop_doc.tree_validation_status if sop_doc.tree_json is not None else None,
+                    variable_count=len(var_schema_raw),
+                    warnings=[],  # 已发布不再返回历史警告
                     published_at=sop_doc.published_at.isoformat() if sop_doc.published_at else None,
                 )
 
             content_md = sop_doc.content_md
+            # 获取旧的 variable_schema（用于三路合并）
+            old_variable_schema: list[dict] = sop_doc.variable_schema or []
 
         # ── 无事务：解析 SOP 决策树（不持有 DB 连接）──────────────────────────
         now = datetime.now(UTC)
@@ -800,6 +808,78 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
                 message="SOP 文档没有 content_md，无法生成决策树",
             )
 
+        # ── 变量提取 + 双向校验（T-AGT-24）────────────────────────────────────────
+        variable_defs: list[dict] = []
+        undeclared_errors: list[str] = []
+        orphan_warnings: list[str] = []
+        warnings: list[str] = []
+        deprecated_vars: list[str] = []  # 三路合并中标记 deprecated 的变量名
+
+        if content_md:
+            # 提取变量（传入解析后的决策树，扫描节点中的变量占位符）
+            tree_for_var = parse_result.tree if (parse_result and parse_result.is_valid) else None
+            new_variable_defs, undeclared_errors, orphan_warnings = extract_sop_variables(
+                content_md, tree_for_var
+            )
+
+            # Undeclared = Error（阻断 approve）
+            if undeclared_errors:
+                logger.warning(
+                    event="sop_undeclared_variables",
+                    document_id=document_id,
+                    undeclared_vars=undeclared_errors,
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail={
+                        "error": "undeclared_variables",
+                        "message": f"SOP 正文使用了未声明的变量：{undeclared_errors}，请在 ## 变量 章节中声明",
+                        "undeclared": undeclared_errors,
+                    },
+                )
+
+            # Orphan = Warning（写入响应）
+            for var_name in orphan_warnings:
+                warnings.append(f"变量 '{var_name}' 已在 ## 变量 章节声明但未在正文中使用")
+
+            # 三路合并（T-AGT-26）：合并新旧 variable_schema
+            if old_variable_schema:
+                variable_defs, deprecated_vars = merge_variable_schema(
+                    old_variable_schema, new_variable_defs
+                )
+                # Deprecated 变量告警（写入响应）
+                for var_name in deprecated_vars:
+                    warnings.append(f"变量 '{var_name}' 已从新版 SOP 中移除，标记为 deprecated")
+                logger.info(
+                    event="sop_variable_merge",
+                    document_id=document_id,
+                    old_count=len(old_variable_schema),
+                    new_count=len(new_variable_defs),
+                    merged_count=len(variable_defs),
+                    deprecated_count=len(deprecated_vars),
+                )
+            else:
+                # 无旧版 schema，直接使用新版
+                variable_defs = new_variable_defs
+
+            # 合并决策树解析警告（成功时）
+            if parse_result and parse_result.is_valid and parse_result.warnings:
+                for w in parse_result.warnings:
+                    warnings.append(f"[决策树] {w.location}: {w.message}")
+
+            # 当决策树解析失败时，将错误信息追加到 warnings
+            if parse_result and not parse_result.is_valid:
+                for e in parse_result.errors:
+                    warnings.append(f"[决策树解析失败] {e.location}: {e.message}")
+
+            logger.info(
+                event="sop_variables_extracted",
+                document_id=document_id,
+                variable_count=len(variable_defs),
+                orphan_count=len(orphan_warnings),
+                deprecated_count=len(deprecated_vars),
+            )
+
         # ── 短事务2：UPDATE sop_document（状态 + tree_json）────────────────────
         async with _db_manager.async_session_factory() as session:
             # 更新状态字段
@@ -824,7 +904,7 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
                 },
             )
 
-            # 写入决策树（若解析成功）
+            # 写入决策树 + variable_schema（若解析成功）
             if parse_result and parse_result.is_valid and parse_result.tree:
                 await session.execute(
                     text(
@@ -836,6 +916,7 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
                             tree_validation_status = :validation_status,
                             tree_validation_issues = CAST(:validation_issues AS jsonb),
                             tree_generator_version = :generator_version,
+                            variable_schema        = CAST(:variable_schema AS jsonb),
                             updated_at             = :updated_at
                         WHERE id = :document_id
                         """
@@ -850,6 +931,7 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
                         if parse_result.warnings
                         else None,
                         "generator_version": "sop-parser-v1",
+                        "variable_schema": json.dumps(variable_defs, ensure_ascii=False) if variable_defs else None,
                         "updated_at": now,
                     },
                 )
@@ -857,6 +939,7 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
                     event="sop_tree_written",
                     document_id=document_id,
                     leaf_count=tree_leaf_count,
+                    variable_count=len(variable_defs),
                 )
 
             await session.commit()
@@ -880,6 +963,7 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
         document_id=document_id,
         reviewer_id=body.reviewer_id,
         tree_generated=tree_generated,
+        variable_count=len(variable_defs),
     )
 
     return SopApproveResponse(
@@ -889,7 +973,9 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
         chunks_embedded=0,
         tree_generated=tree_generated,
         tree_leaf_count=tree_leaf_count if tree_generated else None,
-        tree_validation_status=tree_validation_status if tree_generated else None,
+        tree_validation_status=tree_validation_status,
+        variable_count=len(variable_defs),
+        warnings=warnings,
         published_at=now.isoformat(),
     )
 
@@ -901,7 +987,7 @@ async def approve_sop_document(request: Request, document_id: int, body: SopAppr
 
 @sop_router.get("/{document_id}")
 async def get_sop_document(request: Request, document_id: int):
-    """获取单个 SOP 文档详情（含 content_md 正文）"""
+    """获取单个 SOP 文档详情（含 content_md 正文和 variable_schema）"""
     _check_auth(request)
 
     if _db_manager is None:
@@ -915,7 +1001,8 @@ async def get_sop_document(request: Request, document_id: int):
                         """
                 SELECT id, source_id, category_id, title, content_md, status,
                        reviewer_id, reviewed_at, published_at, created_at, updated_at,
-                       tree_leaf_count, (tree_json IS NOT NULL) AS has_tree
+                       tree_leaf_count, (tree_json IS NOT NULL) AS has_tree,
+                       variable_schema
                 FROM sop_document WHERE id = :id
                 """
                     ),
@@ -938,6 +1025,7 @@ async def get_sop_document(request: Request, document_id: int):
         "status": row["status"],
         "tree_leaf_count": row["tree_leaf_count"],
         "has_tree": row["has_tree"],
+        "variable_schema": row["variable_schema"] or [],
         "reviewer_id": row["reviewer_id"],
         "reviewed_at": row["reviewed_at"].isoformat() if row["reviewed_at"] else None,
         "published_at": row["published_at"].isoformat() if row["published_at"] else None,
@@ -994,7 +1082,7 @@ async def list_sop_documents(
             f"""
             SELECT id, source_id, category_id, title, status,
                    reviewer_id, reviewed_at, published_at, created_at, updated_at, hit_count,
-                   tree_leaf_count, (tree_json IS NOT NULL) AS has_tree
+                   tree_leaf_count, (tree_json IS NOT NULL) AS has_tree, tree_validation_status
             FROM sop_document
             {where_sql}
             ORDER BY created_at DESC, id DESC
@@ -1013,6 +1101,7 @@ async def list_sop_documents(
             "status": row["status"],
             "tree_leaf_count": row["tree_leaf_count"],
             "has_tree": row["has_tree"],
+            "tree_validation_status": row["tree_validation_status"],
             "reviewer_id": row["reviewer_id"],
             "reviewed_at": row["reviewed_at"].isoformat() if row["reviewed_at"] else None,
             "published_at": row["published_at"].isoformat() if row["published_at"] else None,
@@ -1104,6 +1193,162 @@ async def update_sop_status(request: Request, document_id: int, body: SopStatusU
     if downgraded_to_draft:
         resp["message"] = "内容已更新，决策树已清空，文档已降级为草稿，请重新发布"
     return resp
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SOP 变量 Schema 编辑接口（不触发 re-approve）
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+class SopVariableSchemaUpdateRequest(BaseModel):
+    """SOP 变量 Schema 编辑请求（T-AGT-28）
+
+    仅更新指定变量的可编辑字段，不触发 re-approve（不清空 tree_json）。
+    可编辑字段：display_name、description、acquisition_strategy、acquisition_prompt、
+                validation_pattern、acquisition_tool、default_value
+    """
+
+    variables: list[dict] = Field(
+        ...,
+        min_length=1,
+        description="需要更新的变量列表，每项必须包含 name 字段",
+    )
+
+
+@sop_router.patch("/{document_id}/variable-schema")
+async def update_sop_variable_schema(request: Request, document_id: int, body: SopVariableSchemaUpdateRequest):
+    """更新 SOP 变量 Schema 的可编辑字段（不触发 re-approve）
+
+    功能：
+    1. 仅更新指定变量的可编辑字段（display_name、description 等）
+    2. 不触发 re-approve（保持 status 和 tree_json 不变）
+    3. 三路合并兼容：下次 approve 时保留人工编辑字段
+
+    Args:
+        document_id: SOP 文档 ID
+        body.variables: 需要更新的变量列表，每项格式：
+            {
+              "name": "vm_name",                     # 必填，变量名（用于匹配）
+              "display_name": "虚拟机名称",          # 可选
+              "description": "需要操作的虚拟机",      # 可选
+              "acquisition_strategy": "user_confirm",# 可选
+              "acquisition_prompt": "请确认虚拟机",   # 可选
+              "acquisition_tool": "get_vm_list",     # 可选
+              "validation_pattern": "^[a-zA-Z0-9_-]+$", # 可选
+              "default_value": "default-vm"          # 可选
+            }
+
+    Returns:
+        { success, document_id, updated, variable_schema }
+    """
+    _check_auth(request)
+
+    if _db_manager is None:
+        raise HTTPException(status_code=503, detail="数据库未就绪")
+
+    logger.info(event="sop_variable_schema_update_request", document_id=document_id, variables_count=len(body.variables))
+
+    async with _db_manager.async_session_factory() as session:
+        # 1. 查询当前 variable_schema
+        result = await session.execute(
+            text("SELECT id, variable_schema FROM sop_document WHERE id = :id"),
+            {"id": document_id},
+        )
+        row = result.mappings().first()
+
+        if not row:
+            raise HTTPException(status_code=404, detail=f"SOP 文档 {document_id} 不存在")
+
+        current_schema: list[dict] = row["variable_schema"] or []
+
+        if not current_schema:
+            raise HTTPException(
+                status_code=400,
+                detail=f"SOP 文档 {document_id} 无 variable_schema，请先 approve 生成",
+            )
+
+        # 2. 构建更新后的 schema（保留未更新变量）
+        current_by_name = {v["name"]: v for v in current_schema}
+        updated_count = 0
+        allowed_fields = {
+            "display_name",
+            "description",
+            "acquisition_strategy",
+            "acquisition_prompt",
+            "acquisition_tool",
+            "validation_pattern",
+            "default_value",
+        }
+
+        for update_var in body.variables:
+            var_name = update_var.get("name")
+            if not var_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"variables 列表中缺少 name 字段：{update_var}",
+                )
+
+            if var_name not in current_by_name:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"变量 '{var_name}' 不存在于当前 variable_schema 中",
+                )
+
+            # 更新允许的字段（仅更新传入的字段）
+            current_var = current_by_name[var_name]
+            for field, value in update_var.items():
+                if field == "name":
+                    continue  # name 用于匹配，不可修改
+                if field not in allowed_fields:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"字段 '{field}' 不允许编辑，可编辑字段：{sorted(allowed_fields)}",
+                    )
+                # DC-04: validation_pattern 需验证为合法正则，防止写入无效值导致运行时 500
+                if field == "validation_pattern" and value:
+                    try:
+                        re.compile(value)
+                    except re.error as exc:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"变量 '{var_name}' 的 validation_pattern '{value}' 不是合法正则: {exc}",
+                        )
+                current_var[field] = value
+                updated_count += 1
+
+            # 标记为人工编辑（下次 approve 保留）
+            current_var["auto_generated"] = False
+
+        # 3. 写回数据库（不修改 status、tree_json）
+        await session.execute(
+            text(
+                """
+                UPDATE sop_document
+                SET variable_schema = CAST(:variable_schema AS jsonb),
+                    updated_at = :updated_at
+                WHERE id = :id
+                """
+            ),
+            {
+                "id": document_id,
+                "variable_schema": json.dumps(current_schema, ensure_ascii=False),
+                "updated_at": datetime.now(UTC),
+            },
+        )
+        await session.commit()
+
+    logger.info(
+        event="sop_variable_schema_updated",
+        document_id=document_id,
+        updated_fields=updated_count,
+    )
+
+    return {
+        "success": True,
+        "document_id": document_id,
+        "updated": updated_count,
+        "variable_schema": current_schema,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────

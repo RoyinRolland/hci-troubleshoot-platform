@@ -20,7 +20,7 @@ Agent Service - 主应用
 """
 
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from fastapi import FastAPI
 from fastapi.responses import Response
@@ -35,12 +35,14 @@ from shared.utils.exception_handlers import register_exception_handlers
 from app.adapters.agents.agent_router import AgentRouter
 from app.adapters.agents.htp.confirm_service import ConfirmService
 from app.adapters.agents.htp.diagnostic_agent import DiagnosticAgent
-from app.adapters.agents.htp.intent_agent import IntentAgent
+from app.adapters.agents.htp.investigation_agent import InvestigationAgent  # T-AGT-11：主用 S1-S4
 from app.adapters.agents.htp.react_engine import ReactEngine
+from app.adapters.agents.htp.remediation_agent import RemediationAgent  # T-AGT-12：S5 修复执行
+from app.adapters.agents.htp.triage_agent import TriageAgent  # T-AGT-10：替换 IntentAgent
 from app.adapters.agents.ops.ops_agent_adapter import OpsAgentAdapter
 from app.config import settings
 from app.routes.agent import router as agent_router_route
-from app.routes.agent import set_agent_router
+from app.routes.agent import set_agent_router, set_confirm_service
 
 if TYPE_CHECKING:
     from app.adapters.clients.acli_client import AcliClient
@@ -110,8 +112,9 @@ async def lifespan(app: FastAPI):
         )
         redis_client = None
 
-    # ── IntentAgent（S0 意图识别）──────────────────────────────────────────────────
-    intent_agent = IntentAgent(
+    # ── TriageAgent（S0 意图识别）──────────────────────────────────────────────────
+    # T-AGT-10：TriageAgent 替换 IntentAgent（继承 BaseAgent）
+    triage_agent = TriageAgent(
         ai_registry=ai_registry,
         kb_client=kb_client,
     )
@@ -119,6 +122,12 @@ async def lifespan(app: FastAPI):
     # ── DiagnosticAgent（S1+ 诊断推理）─────────────────────────────────────────────
     # 先实例化 ReactEngine（可选）
     react_engine: ReactEngine | None = None
+    scp_client = None  # 确保变量存在，供 InvestigationAgent 使用
+    acli_client = None  # 确保变量存在，供 InvestigationAgent 使用
+    tool_executor = None  # 确保变量存在，供 InvestigationAgent 使用
+    confirm_service: ConfirmService | None = None
+    audit_service = FileAuditService()
+
     if settings.REACT_ENABLED:
         # 实例化工具执行客户端
         from app.adapters.clients.acli_client import AcliClient
@@ -128,21 +137,19 @@ async def lifespan(app: FastAPI):
         acli_client = AcliClient.from_env()
 
         # 实例化确认服务（依赖 Redis）
-        confirm_service: ConfirmService | None = None
         if redis_client is not None:
             confirm_service = ConfirmService(redis=redis_client)
 
-        # 实例化审计服务（简单文件日志实现）
-        audit_service = FileAuditService()
-
-        # 实例化复合工具执行器（合并 SCP 和 Acli）
+        # 实例化复合工具执行器（合并 SCP、Acli 和 SOP）
         tool_executor = CompositeToolExecutor(
             scp=scp_client,
             acli=acli_client,
+            kb_client=kb_client,
         )
 
         # 实例化 ReactEngine
         from app.adapters.agents.htp.tool_registry import TOOL_REGISTRY
+
         react_engine = ReactEngine(
             ai_registry=ai_registry,
             tool_registry=TOOL_REGISTRY,
@@ -156,12 +163,48 @@ async def lifespan(app: FastAPI):
             message="ReAct 引擎已初始化",
         )
 
-    # 实例化 DiagnosticAgent
+    # 实例化 DiagnosticAgent（降级备用）
     diagnostic_agent = DiagnosticAgent(
         ai_registry=ai_registry,
         kb_client=kb_client,
         react_engine=react_engine,
     )
+
+    # ── InvestigationAgent（S1-S4 诊断调查）──────────────────────────────────────────────
+    # T-AGT-11：主用 S1-S4 阶段，继承 BaseAgent
+    # 使用已有的 tool_executor（如果 REACT_ENABLED），否则创建新的
+    investigation_tool_executor = tool_executor or CompositeToolExecutor(
+        scp=scp_client,
+        acli=acli_client,
+        kb_client=kb_client,
+    )
+    investigation_agent = InvestigationAgent(
+        ai_registry=ai_registry,
+        kb_client=kb_client,
+        tool_executor=investigation_tool_executor,
+        conversation_service_url=settings.CONVERSATION_SERVICE_URL,  # T-AGT-22
+        internal_token=settings.INTERNAL_API_TOKEN,  # T-AGT-22
+        top_k=15,
+    )
+    logger.info(
+        event="investigation_agent_initialized",
+        conversation_service_url=settings.CONVERSATION_SERVICE_URL,
+        message="InvestigationAgent 已初始化（S1-S4，支持 SOP ReactEngine）",
+    )
+
+    # ── RemediationAgent（S5 修复执行）────────────────────────────────────────────────
+    # T-AGT-12：require_all_confirm=True，所有工具调用均需用户确认
+    remediation_agent: RemediationAgent | None = None
+    if react_engine is not None:
+        remediation_agent = RemediationAgent(
+            ai_registry=ai_registry,
+            kb_client=kb_client,
+            react_engine=react_engine,
+        )
+        logger.info(
+            event="remediation_agent_initialized",
+            message="RemediationAgent 已初始化（S5 修复执行，require_all_confirm=True）",
+        )
 
     # ── OpsAgent 适配器（可选）─────────────────────────────────────────────────────
     ops_adapter: OpsAgentAdapter | None = None
@@ -173,18 +216,26 @@ async def lifespan(app: FastAPI):
     if settings.PYDANTIC_AI_ENABLED:
         from app.adapters.agents.pai.pai_agent_adapter import PaiAgentAdapter
         from app.adapters.clients.acli_client import AcliClient
+        from app.adapters.clients.scp_client import SCPClient
 
         _acli = AcliClient.from_env()
+        # 复用 ReAct 块创建的 scp_client（如果已初始化），否则新建
+        _scp = scp_client if scp_client is not None else SCPClient.from_env()
         pai_adapter = PaiAgentAdapter.from_env(
-            scp_client=None,
+            scp_client=_scp,
             acli_client=_acli,
             kb_client=kb_client,
         )
 
     # ── 组装 AgentRouter ────────────────────────────────────────────────────────────
+    # T-AGT-10：使用 TriageAgent
+    # T-AGT-11：使用 InvestigationAgent 主用 S1-S4，DiagnosticAgent 降级备用
+    # T-AGT-12：使用 RemediationAgent 处理 S5 修复执行
     agent_router = AgentRouter(
-        intent_agent=intent_agent,
+        triage_agent=triage_agent,
+        investigation_agent=investigation_agent,
         diagnostic_agent=diagnostic_agent,
+        remediation_agent=remediation_agent,  # T-AGT-12
         ops_agent_adapter=ops_adapter,
         pai_adapter=pai_adapter,
         ai_registry=ai_registry,
@@ -192,6 +243,8 @@ async def lifespan(app: FastAPI):
 
     # 注入路由模块
     set_agent_router(agent_router)
+    # 注入 ConfirmService（用于 ReAct 确认回路）
+    set_confirm_service(confirm_service)
 
     logger.info(
         event="agent_router_initialized",
@@ -232,7 +285,7 @@ class FileAuditService:
 
 
 class CompositeToolExecutor:
-    """复合工具执行器：合并 SCP 和 Acli 客户端
+    """复合工具执行器：合并 SCP、Acli 和 SOP 客户端
 
     实现 ToolExecutor Protocol，根据工具 category 分发到对应客户端。
     """
@@ -241,12 +294,15 @@ class CompositeToolExecutor:
         self,
         scp: "SCPClient",
         acli: "AcliClient",
+        kb_client: KBClient | None = None,
     ) -> None:
         self._scp = scp
         self._acli = acli
+        self._kb_client = kb_client
 
-    async def execute(self, tool_name: str, args: dict) -> any:
+    async def execute(self, tool_name: str, args: dict) -> Any:
         """执行工具调用，根据工具类型分发"""
+        from app.adapters.agents.htp.sop_tools import get_sop_node
         from app.adapters.agents.htp.tool_registry import TOOL_REGISTRY
 
         tool_def = TOOL_REGISTRY.get(tool_name)
@@ -257,6 +313,21 @@ class CompositeToolExecutor:
             return await self._scp.execute(tool_name, args)
         elif tool_def.category == "acli":
             return await self._acli.execute(tool_name, args)
+        elif tool_def.category == "sop":
+            # SOP 工具需要 kb_client 和 sop_document_id
+            if tool_name == "get_sop_node":
+                if self._kb_client is None:
+                    return {"error": "KB 客户端未初始化，无法执行 SOP 工具"}
+                sop_document_id = args.get("sop_document_id")
+                if not sop_document_id:
+                    return {"error": "get_sop_node 工具缺少 sop_document_id 参数"}
+                return await get_sop_node(
+                    node_id=args.get("node_id", ""),
+                    sop_document_id=int(sop_document_id),
+                    kb_client=self._kb_client,
+                )
+            else:
+                return {"error": f"SOP 工具 {tool_name} 未实现"}
         else:
             return {"error": f"工具类别 {tool_def.category} 无对应执行器"}
 

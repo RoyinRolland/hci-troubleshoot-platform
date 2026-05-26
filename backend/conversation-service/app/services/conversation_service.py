@@ -20,6 +20,7 @@ from app.config import settings
 
 from ..models.message import Message, MessageRole
 from ..repositories.conversation_repo import ConversationRepository
+from ..repositories.sop_execution_repository import SopExecutionRepository
 from .agent_client import AgentClient
 from .conversation_manager import ConversationManager
 from .environment_client import EnvironmentClient
@@ -276,6 +277,31 @@ class ConversationService:
         for msg in selected_messages:
             history_messages.append({"role": msg.role.value, "content": msg.content})
 
+        # T-AGT-23: 检测 SOP 执行恢复状态
+        sop_resume_context: dict | None = None
+        if self.session_factory:
+            async with self.session_factory() as sop_session:
+                sop_repo = SopExecutionRepository(sop_session)
+                sop_execution = await sop_repo.get_active_by_conversation(conversation_id)
+                if sop_execution:
+                    # 存在活跃的 SOP 执行，构建恢复上下文
+                    sop_resume_context = {
+                        "sop_document_id": sop_execution.sop_document_id,
+                        "current_node_id": sop_execution.current_node_id,
+                        "completed_steps": sop_execution.completed_steps or [],
+                        "context_variables": sop_execution.context_variables or {},
+                        "execution_log": sop_execution.execution_log or [],
+                        "status": sop_execution.status,
+                    }
+                    logger.info(
+                        event="sop_execution_resume_detected",
+                        message="检测到活跃的 SOP 执行，构建恢复上下文",
+                        conversation_id=str(conversation_id),
+                        sop_document_id=sop_execution.sop_document_id,
+                        current_node_id=sop_execution.current_node_id,
+                        completed_steps_count=len(sop_execution.completed_steps or []),
+                    )
+
         # 4. 从注册表获取 AI 助手客户端
         resolved_assistant_type = await self._resolve_assistant_type(conversation_id, assistant_type)
 
@@ -303,6 +329,7 @@ class ConversationService:
                     stream=True,
                     diagnostic_stage=current_stage,
                     category_id=_confirmed_category_code,
+                    sop_resume_context=sop_resume_context,  # T-AGT-23: SOP 执行恢复上下文
                 ):
                     event_type = agent_event.get("type")
                     if event_type == "text_chunk":
@@ -312,7 +339,30 @@ class ConversationService:
                             yield _chunk
                     elif event_type == "stage_update":
                         _stage = agent_event.get("stage", "")
+                        _metadata = agent_event.get("metadata", {})
                         yield f"\x00event:stage_change:{_stage}\x00"
+                        # T-AGT-07: 处理 SOP 命中统计（sop_reasoning 事件携带 sop_document_id）
+                        if _stage == "sop_reasoning" and _metadata.get("sop_document_id"):
+                            _sop_doc_id = _metadata.get("sop_document_id")
+                            if _sop_doc_id and isinstance(_sop_doc_id, int):
+                                asyncio.create_task(
+                                    self._update_sop_usage(
+                                        conversation_id=conversation_id,
+                                        case_id=case_id,
+                                        sop_document_id=_sop_doc_id,
+                                    )
+                                )
+                        # T-AGT-14: 处理 pydantic-ai 工具调用记录（tool_call / tool_result）
+                        elif _stage in ("tool_call", "tool_result"):
+                            asyncio.create_task(
+                                self._record_pai_tool_call(
+                                    conversation_id=conversation_id,
+                                    case_id=case_id,
+                                    stage=_stage,
+                                    metadata=_metadata,
+                                    resolved_assistant_type=resolved_assistant_type,
+                                )
+                            )
                     elif event_type == "interactive_request":
                         _ir_payload = _json.dumps(
                             {
@@ -1126,6 +1176,163 @@ class ConversationService:
                 sop_document_id=sop_document_id,
             )
 
+    async def _record_pai_tool_call(
+        self,
+        conversation_id: uuid.UUID,
+        case_id: str,
+        stage: str,
+        metadata: dict[str, Any],
+        resolved_assistant_type: str,
+    ) -> None:
+        """
+        记录 pydantic-ai (pai-agent) 工具调用到 tool_result 表（T-AGT-14）。
+
+        pai-agent 工具调用事件包含：
+          - stage="tool_call": 工具调用开始，记录 tool_name、args、status="pending"
+          - stage="tool_result": 工具调用完成，记录 tool_name、result、status="completed"/"error"
+
+        Args:
+            conversation_id: 会话 ID
+            case_id: 工单 ID
+            stage: 事件阶段（tool_call / tool_result）
+            metadata: 事件元数据（tool_name, tool_args/tool_result, status 等）
+            resolved_assistant_type: 解析后的助手类型（用于区分 pai-agent）
+        """
+        from datetime import UTC, datetime
+
+        from shared.models.audit import ToolResult
+
+        # 仅记录 pai-agent 的工具调用
+        if resolved_assistant_type != "pydantic-ai":
+            return
+
+        tool_name = metadata.get("tool_name", "")
+        if not tool_name:
+            logger.warning(
+                event="pai_tool_call_missing_name",
+                message="pai-agent 工具调用事件缺少 tool_name",
+                conversation_id=str(conversation_id),
+                stage=stage,
+            )
+            return
+
+        try:
+            if self.session_factory:
+                async with self.session_factory() as session:
+                    # 根据阶段决定写入内容
+                    if stage == "tool_call":
+                        # 工具调用开始：创建新记录
+                        record = ToolResult(
+                            conversation_id=conversation_id,
+                            tool_name=tool_name,
+                            tool_type="scp_api",  # pai-agent 工具主要为 SCP API
+                            risk_level=1,  # 只读工具
+                            policy="auto",  # 自动执行
+                            input_json=metadata.get("tool_args", {}),
+                            output_json=None,
+                            error=None,
+                            started_at=datetime.now(UTC),
+                            completed_at=None,
+                            duration_ms=None,
+                            trace_id=get_current_trace_id(),
+                        )
+                        session.add(record)
+                        await session.commit()
+                        logger.info(
+                            event="pai_tool_call_started",
+                            message=f"pai-agent 工具调用开始：{tool_name}",
+                            conversation_id=str(conversation_id),
+                            tool_name=tool_name,
+                            tool_args=metadata.get("tool_args"),
+                        )
+
+                    elif stage == "tool_result":
+                        # 工具调用完成：查找待更新记录并填充结果
+                        from sqlalchemy import select
+                        from sqlalchemy import update as sa_update
+
+                        status = metadata.get("status", "completed")
+                        tool_result = metadata.get("tool_result")
+                        error = metadata.get("error")
+
+                        # ⚠️ 已知问题：并发竞态
+                        # tool_call 和 tool_result 事件通过 asyncio.create_task() 并发提交，
+                        # tool_result 可能先于 tool_call 落库，导致找不到 pending 记录。
+                        # 修复建议：在 metadata 中携带稳定关联键（tool_call_id/run_id），
+                        # 或将写入统一队列串行处理。
+                        # 查找最近的 pending 记录
+                        result = await session.execute(
+                            select(ToolResult)
+                            .where(
+                                ToolResult.conversation_id == conversation_id,
+                                ToolResult.tool_name == tool_name,
+                                ToolResult.completed_at.is_(None),
+                            )
+                            .order_by(ToolResult.started_at.desc())
+                            .limit(1)
+                        )
+                        pending_record = result.scalar_one_or_none()
+
+                        if pending_record:
+                            # 更新现有记录
+                            now = datetime.now(UTC)
+                            duration_ms = int(
+                                (now - pending_record.started_at).total_seconds() * 1000
+                            )
+                            await session.execute(
+                                sa_update(ToolResult)
+                                .where(ToolResult.id == pending_record.id)
+                                .values(
+                                    output_json=tool_result,
+                                    error=error,
+                                    completed_at=now,
+                                    duration_ms=duration_ms,
+                                )
+                            )
+                            await session.commit()
+                            logger.info(
+                                event="pai_tool_call_completed",
+                                message=f"pai-agent 工具调用完成：{tool_name}",
+                                conversation_id=str(conversation_id),
+                                tool_name=tool_name,
+                                status=status,
+                                duration_ms=duration_ms,
+                            )
+                        else:
+                            # 没有找到 pending 记录，创建新的完整记录
+                            record = ToolResult(
+                                conversation_id=conversation_id,
+                                tool_name=tool_name,
+                                tool_type="scp_api",
+                                risk_level=1,
+                                policy="auto",
+                                input_json={},
+                                output_json=tool_result,
+                                error=error,
+                                started_at=datetime.now(UTC),
+                                completed_at=datetime.now(UTC),
+                                duration_ms=0,
+                                trace_id=get_current_trace_id(),
+                            )
+                            session.add(record)
+                            await session.commit()
+                            logger.info(
+                                event="pai_tool_call_record_created",
+                                message=f"pai-agent 工具调用记录创建：{tool_name}",
+                                conversation_id=str(conversation_id),
+                                tool_name=tool_name,
+                                status=status,
+                            )
+
+        except Exception as e:
+            logger.warning(
+                event="pai_tool_call_record_error",
+                message=f"pai-agent 工具调用记录失败：{e}",
+                conversation_id=str(conversation_id),
+                tool_name=tool_name,
+                stage=stage,
+            )
+
     async def _update_resolved_kbd(
         self,
         conversation_id: uuid.UUID,
@@ -1586,56 +1793,94 @@ class ConversationService:
     async def submit_interactive_response(
         self,
         conversation_id: uuid.UUID,
+        kind: str,
         request_id: str,
         acp_session_id: str,
         outcome: dict,
     ) -> bool:
-        """T-E6: 将用户对交互卡片的响应回传给 ops-agent ACP 会话。
+        """T-E6 + T-AGT-03: 将用户对交互卡片的响应回传给 agent-service。
 
-        由 POST /api/conversations/{id}/interactive-response 调用。
-        仅在 AgentRouter 已注入且 OpsAgentAdapter 可用时生效。
+        按 kind 字段分叉路由：
+        - kind=tool_confirm → 调用 agent-service /v1/agent/react-confirm（ReAct 确认回路）
+        - 其他 kind（ACP 类型）→ 调用 agent-service /v1/agent/interactive-response（ops-agent ACP）
 
         Args:
             conversation_id: 对话 ID（用于日志追踪）。
+            kind:            交互类型（tool_confirm / sop_step / info_confirm 等）。
             request_id:      ACP request_id（来自 AgentInteractiveRequest.request_id）。
             acp_session_id:  ops-agent ACP session_id（来自 AgentInteractiveRequest.acp_session_id）。
             outcome:         提交结果，格式 {"outcome": "selected", "optionId": "A"}
-                             或 {"outcome": "free_text", "text": "..."}。
+                             或 {"outcome": "free_text", "text": "..."}
+                             或 {"confirmed": true, "authorized_by": "user"}（tool_confirm）。
 
         Returns:
-            True  = 提交成功；False = OpsAgentAdapter 不可用（ops-agent 未启用）。
+            True  = 提交成功；False = AgentClient 未注入或请求失败。
         """
         if self._agent_client is None:
             logger.warning(
                 event="interactive_response_no_client",
                 message="submit_interactive_response: AgentClient 未注入，跳过",
                 conversation_id=str(conversation_id),
+                kind=kind,
                 request_id=request_id,
             )
             return False
 
-        try:
-            success = await self._agent_client.submit_interactive_response(
+        session_id = str(conversation_id)
+
+        # 按 kind 分叉路由
+        if kind == "tool_confirm":
+            # ── ReAct 确认回路（T-AGT-03）────────────────────────────────────────────
+            confirmed = bool(outcome.get("confirmed", False))
+            authorized_by = outcome.get("authorized_by", "user")
+            try:
+                success = await self._agent_client.react_confirm(
+                    session_id=session_id,
+                    confirmed=confirmed,
+                    authorized_by=authorized_by,
+                )
+            except Exception as exc:
+                logger.warning(
+                    event="react_confirm_error",
+                    message=f"react_confirm 异常: {exc}",
+                    conversation_id=str(conversation_id),
+                    session_id=session_id,
+                )
+                return False
+            logger.info(
+                event="react_confirm_submitted",
+                message="ReAct 工具确认已提交",
+                conversation_id=str(conversation_id),
+                session_id=session_id,
+                confirmed=confirmed,
+                authorized_by=authorized_by,
+                success=success,
+            )
+        else:
+            # ── ACP 路径（ops-agent SOP/信息确认卡）──────────────────────────────────
+            try:
+                success = await self._agent_client.submit_interactive_response(
+                    acp_session_id=acp_session_id,
+                    request_id=request_id,
+                    outcome=outcome,
+                )
+            except Exception as exc:
+                logger.warning(
+                    event="interactive_response_error",
+                    message=f"submit_interactive_response 异常: {exc}",
+                    conversation_id=str(conversation_id),
+                    request_id=request_id,
+                )
+                return False
+            logger.info(
+                event="interactive_response_submitted",
+                message="ops-agent 交互响应已回传",
+                conversation_id=str(conversation_id),
                 acp_session_id=acp_session_id,
                 request_id=request_id,
-                outcome=outcome,
+                success=success,
             )
-        except Exception as exc:
-            logger.warning(
-                event="interactive_response_error",
-                message=f"submit_interactive_response 异常: {exc}",
-                conversation_id=str(conversation_id),
-                request_id=request_id,
-            )
-            return False
-        logger.info(
-            event="interactive_response_submitted",
-            message="ops-agent 交互响应已回传",
-            conversation_id=str(conversation_id),
-            acp_session_id=acp_session_id,
-            request_id=request_id,
-            success=success,
-        )
+
         # 将用户的弹框选择/输入以 user 角色落库，供历史记录查看
         try:
             conv = await self.repository.get_conversation(conversation_id)
@@ -1648,6 +1893,7 @@ class ConversationService:
                     trace_id=get_current_trace_id(),
                     metadata={
                         "kind": "interactive_response",
+                        "interactive_kind": kind,
                         "requestId": request_id,
                         "acpSessionId": acp_session_id,
                         "outcome": outcome,
