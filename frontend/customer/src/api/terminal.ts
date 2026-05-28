@@ -31,10 +31,13 @@ export interface TerminalWsMessage {
   | 'ssh_error'
   | 'pong'
   | 'bridge_ready'
+  | 'exec_result'  // T-TOOL-01: Agent 命令执行结果
   case_id?: string
   output?: string
   message?: string
   detail?: string
+  exec_id?: string  // exec_result 消息的执行 ID
+  exit_code?: number  // exec_result 消息的退出码
 }
 
 /**
@@ -218,4 +221,59 @@ export function parseJsonOutput(output: string): unknown {
   }
 
   return null
+}
+
+// ===== Agent 命令执行辅助函数 =====
+// 供 Agent 远程执行命令并解析结果
+
+/**
+ * 构造 Agent 执行命令的 WebSocket 消息（ssh_exec_command 类型）。
+ * 命令末尾自动追加 marker，用于捕获执行结果。
+ */
+export function buildAgentExecMessage(
+  caseId: string,
+  execId: string,
+  rawCommand: string
+): string {
+  const markerId = execId.replace(/-/g, '').substring(0, 16)
+  const marker = `__EXEC_DONE_${markerId}`
+  const command = `${rawCommand}; status=$?; printf '\\n${marker}:%s\\n' "$status"\n`
+  return JSON.stringify({
+    type: 'ssh_exec_command',
+    case_id: caseId,
+    exec_id: execId,
+    command,
+  })
+}
+
+/**
+ * 解析 exec_result 消息中的 output 和 exit_code。
+ */
+export function parseAgentExecResult(message: unknown): {
+  execId: string
+  output: string
+  exitCode: number
+} | null {
+  if (typeof message !== 'object' || message === null) {
+    return null
+  }
+
+  const msg = message as Record<string, unknown>
+  if (msg.type !== 'exec_result') {
+    return null
+  }
+
+  const execId = typeof msg.exec_id === 'string' ? msg.exec_id : undefined
+  const output = typeof msg.output === 'string' ? msg.output : ''
+  const exitCode = typeof msg.exit_code === 'number' ? msg.exit_code : 0
+
+  if (!execId) {
+    return null
+  }
+
+  return {
+    execId,
+    output,
+    exitCode,
+  }
 }
