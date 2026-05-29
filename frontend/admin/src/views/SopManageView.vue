@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
+import { Warning } from '@element-plus/icons-vue'
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 类型定义
@@ -11,7 +12,8 @@ interface SopDocument {
   category_id: string | null
   title: string
   status: string
-  chunk_count: number
+  tree_leaf_count: number // 决策树叶节点数量
+  tree_validation_issues?: ValidationIssue[] // 决策树校验问题（有告警时存储）
   content_md?: string
   tree_validation_status: string | null // 决策树校验状态：valid/warnings/error
   has_tree: boolean // 是否有决策树
@@ -35,6 +37,38 @@ interface ValidationIssue {
   location: string
   line_number: number | null
   message: string
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// SOP 决策树类型定义
+// ──────────────────────────────────────────────────────────────────────────────
+interface PrerequisiteItem {
+  description: string
+  type: 'filter' | 'priority'
+  target_node_hint?: string
+}
+
+interface DiagnosisDetail {
+  acli_methods: string[]
+  page_methods?: string[]
+  analysis_steps?: string[]
+  possible_causes?: string[]
+}
+
+interface SolutionDetail {
+  quick_recovery: string[]
+  thorough_fix: string[]
+}
+
+interface SOPNode {
+  id: string
+  title: string
+  level: number
+  line_number: number
+  children: SOPNode[]
+  prerequisite_items: PrerequisiteItem[]
+  diagnosis?: DiagnosisDetail
+  solution?: SolutionDetail
 }
 
 // 分类基线选项
@@ -100,6 +134,17 @@ const importFile = ref<File | null>(null)
 const importCategoryId = ref('')
 const importLoading = ref(false)
 const importFileInput = ref<HTMLInputElement | null>(null)
+
+// ─── 决策树可视化 ──────────────────────────────────────────────────────────────
+const viewTreeLoading = ref(false)
+const viewTreeData = ref<SOPNode | null>(null)
+const viewTreeExpandedKeys = ref<string[]>([])
+
+// el-tree 配置
+const treeProps = {
+  children: 'children',
+  label: 'title',
+}
 
 // ──────────────────────────────────────────────────────────────────────────────
 // API
@@ -174,7 +219,7 @@ async function fetchDocuments() {
 async function handleApprove(doc: SopDocument) {
   try {
     await ElMessageBox.confirm(
-      `确认发布 SOP 文档？\n\n「${doc.title}」\n\n将解析决策树并生成向量索引，耗时较长，请耐心等待。`,
+      `确认发布 SOP 文档？\n\n「${doc.title}」\n\n将解析生成决策树，耗时较长，请耐心等待。`,
       '发布 SOP',
       { confirmButtonText: '确认发布', cancelButtonText: '取消', type: 'success' },
     )
@@ -263,6 +308,54 @@ async function handleArchive(doc: SopDocument) {
 function openViewDialog(doc: SopDocument) {
   viewDoc.value = doc
   viewDialogVisible.value = true
+  // 重置决策树状态
+  viewTreeData.value = null
+  viewTreeExpandedKeys.value = []
+  // 若文档有决策树，异步加载
+  if (doc.has_tree) {
+    fetchViewTree(doc.id)
+  }
+}
+
+// ─── 决策树数据获取 ──────────────────────────────────────────────────────────
+async function fetchViewTree(documentId: number) {
+  viewTreeLoading.value = true
+  try {
+    const resp = await fetch(`/api/v1/sop/${documentId}/tree`, { headers: authHeader })
+    if (resp.ok) {
+      viewTreeData.value = await resp.json()
+      // 默认展开第一层节点
+      if (viewTreeData.value?.id) {
+        viewTreeExpandedKeys.value = [viewTreeData.value.id]
+      }
+    } else if (resp.status !== 404) {
+      ElMessage.warning('决策树加载失败')
+    }
+  } catch {
+    ElMessage.warning('决策树加载失败，请稍后重试')
+  } finally {
+    viewTreeLoading.value = false
+  }
+}
+
+// ─── 决策树展开/折叠 ──────────────────────────────────────────────────────────
+function expandAllNodes() {
+  if (!viewTreeData.value) return
+  viewTreeExpandedKeys.value = collectAllNodeIds(viewTreeData.value)
+}
+
+function collapseAllNodes() {
+  viewTreeExpandedKeys.value = []
+}
+
+function collectAllNodeIds(node: SOPNode): string[] {
+  const ids = [node.id]
+  if (node.children?.length) {
+    for (const child of node.children) {
+      ids.push(...collectAllNodeIds(child))
+    }
+  }
+  return ids
 }
 
 // ─── 编辑 ────────────────────────────────────────────────────────────────────
@@ -398,7 +491,7 @@ async function submitImport() {
     if (result.duplicate) {
       ElMessage.warning(result.message || '文件已存在，跳过导入')
     } else {
-      ElMessage.success(`导入成功：「${result.title}」，共 ${result.chunks_created} 个分块，状态为草稿`)
+      ElMessage.success(`导入成功：「${result.title}」，状态为草稿，请发布后使用`)
     }
     importDialogVisible.value = false
     await fetchDocuments()
@@ -464,6 +557,20 @@ function treeValidationLabel(s: string | null, hasTree: boolean): string {
   return '无决策树'
 }
 
+// 打开决策树告警详情弹窗
+function openValidationDialog(doc: SopDocument) {
+  validationDocTitle.value = doc.title
+  // 如果行数据中有 tree_validation_issues，直接使用
+  if (doc.tree_validation_issues?.length) {
+    validationIssues.value = doc.tree_validation_issues
+    validationDialogVisible.value = true
+  } else {
+    // 否则提示没有告警详情数据
+    ElMessage.info('该文档的告警详情需从查看弹窗中获取')
+    openViewDialog(doc)
+  }
+}
+
 onMounted(() => {
   fetchDocuments()
   fetchCategories()
@@ -527,15 +634,28 @@ onMounted(() => {
             <el-tag :type="statusType(row.status)" size="small">{{ statusLabel(row.status) }}</el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="决策树" width="100" align="center">
+        <el-table-column label="决策树" width="120" align="center">
           <template #default="{ row }">
-            <el-tag :type="treeValidationType(row.tree_validation_status)" size="small">
-              {{ treeValidationLabel(row.tree_validation_status, row.has_tree) }}
-            </el-tag>
+            <div style="display:flex;align-items:center;gap:4px;justify-content:center">
+              <el-tag :type="treeValidationType(row.tree_validation_status)" size="small">
+                {{ treeValidationLabel(row.tree_validation_status, row.has_tree) }}
+              </el-tag>
+              <el-button
+                v-if="row.tree_validation_status === 'warnings'"
+                type="warning"
+                size="small"
+                text
+                circle
+                @click.stop="openValidationDialog(row)"
+                title="查看告警详情"
+              >
+                <el-icon><Warning /></el-icon>
+              </el-button>
+            </div>
           </template>
         </el-table-column>
-        <el-table-column label="分块数" width="90" align="center">
-          <template #default="{ row }"><span class="chunk-count">{{ row.chunk_count }}</span></template>
+        <el-table-column label="节点数" width="90" align="center">
+          <template #default="{ row }"><span class="node-count">{{ row.tree_leaf_count }}</span></template>
         </el-table-column>
         <el-table-column label="发布时间" width="160">
           <template #default="{ row }">
@@ -566,22 +686,114 @@ onMounted(() => {
     </el-card>
 
     <!-- ── 查看弹窗 ── -->
-    <el-dialog v-model="viewDialogVisible" title="SOP 文档详情" width="760px" top="4vh">
+    <el-dialog v-model="viewDialogVisible" title="SOP 文档详情" width="900px" top="4vh">
       <template v-if="viewDoc">
-        <el-descriptions :column="3" border size="small" style="margin-bottom:16px">
+        <!-- 基础信息区 -->
+        <el-descriptions :column="4" border size="small" style="margin-bottom:16px">
           <el-descriptions-item label="ID">#{{ viewDoc.id }}</el-descriptions-item>
           <el-descriptions-item label="状态">
             <el-tag :type="statusType(viewDoc.status)" size="small">{{ statusLabel(viewDoc.status) }}</el-tag>
           </el-descriptions-item>
-          <el-descriptions-item label="分块数">{{ viewDoc.chunk_count }}</el-descriptions-item>
+          <el-descriptions-item label="决策树">
+            <el-tag :type="treeValidationType(viewDoc.tree_validation_status)" size="small">
+              {{ treeValidationLabel(viewDoc.tree_validation_status, viewDoc.has_tree) }}
+            </el-tag>
+          </el-descriptions-item>
           <el-descriptions-item label="分类">{{ viewDoc.category_id || '—' }}</el-descriptions-item>
           <el-descriptions-item label="导入时间">{{ formatDate(viewDoc.created_at) }}</el-descriptions-item>
           <el-descriptions-item label="发布时间">{{ formatDate(viewDoc.published_at) }}</el-descriptions-item>
-          <el-descriptions-item label="标题" :span="3"><strong>{{ viewDoc.title }}</strong></el-descriptions-item>
+          <el-descriptions-item label="标题" :span="2"><strong>{{ viewDoc.title }}</strong></el-descriptions-item>
         </el-descriptions>
-        <el-alert type="info" :closable="false" show-icon>
-          <template #title>内容说明</template>
-          文档共 {{ viewDoc.chunk_count }} 个章节分块，已按标题拆分存入向量数据库。如需查看原始内容，请参考导入时的源文件。
+
+        <!-- 决策树可视化区 -->
+        <div v-if="viewDoc.has_tree" class="tree-section">
+          <div class="tree-header">
+            <span class="tree-title">决策树结构</span>
+            <div class="tree-actions">
+              <el-button size="small" text @click="expandAllNodes">全部展开</el-button>
+              <el-button size="small" text @click="collapseAllNodes">全部折叠</el-button>
+            </div>
+          </div>
+          <div v-loading="viewTreeLoading" class="tree-container">
+            <template v-if="viewTreeData">
+              <el-tree
+                :data="[viewTreeData]"
+                :props="treeProps"
+                node-key="id"
+                :expand-on-click-node="false"
+                :default-expanded-keys="viewTreeExpandedKeys"
+                highlight-current
+              >
+                <template #default="{ data }">
+                  <div class="tree-node-content">
+                    <!-- 节点标题行 -->
+                    <div class="node-header">
+                      <span :class="['node-level', `level-${data.level}`]">L{{ data.level }}</span>
+                      <span class="node-title">{{ data.title }}</span>
+                      <el-tag v-if="!data.children?.length" type="success" size="small" class="node-type-tag">叶节点</el-tag>
+                      <el-tag v-else type="info" size="small" class="node-type-tag">路由节点</el-tag>
+                      <span class="node-line">行 {{ data.line_number }}</span>
+                    </div>
+                    <!-- 前置条件（路由节点） -->
+                    <div v-if="data.prerequisite_items?.length" class="node-prerequisites">
+                      <span class="section-label">前置条件：</span>
+                      <div class="prerequisite-list">
+                        <div v-for="(p, idx) in data.prerequisite_items" :key="idx" class="prerequisite-item">
+                          <el-tag :type="p.type === 'filter' ? 'primary' : 'warning'" size="small">
+                            {{ p.type === 'filter' ? '过滤' : '优先' }}
+                          </el-tag>
+                          <span class="prerequisite-desc">{{ p.description }}</span>
+                        </div>
+                      </div>
+                    </div>
+                    <!-- 诊断方法（叶节点） -->
+                    <div v-if="data.diagnosis" class="node-diagnosis">
+                      <div class="diagnosis-section">
+                        <span class="section-label">诊断方法：</span>
+                        <ul class="method-list">
+                          <li v-for="(m, idx) in data.diagnosis.acli_methods" :key="idx">
+                            <code>{{ m }}</code>
+                          </li>
+                          <template v-if="data.diagnosis.page_methods?.length">
+                            <li v-for="(m, idx) in data.diagnosis.page_methods" :key="'page-'+idx" class="page-method">
+                              <span class="method-type">页面：</span><code>{{ m }}</code>
+                            </li>
+                          </template>
+                        </ul>
+                      </div>
+                      <div v-if="data.diagnosis.possible_causes?.length" class="causes-section">
+                        <span class="section-label">可能原因：</span>
+                        <ul class="cause-list">
+                          <li v-for="(c, idx) in data.diagnosis.possible_causes" :key="idx">{{ c }}</li>
+                        </ul>
+                      </div>
+                    </div>
+                    <!-- 解决方案（叶节点） -->
+                    <div v-if="data.solution" class="node-solution">
+                      <div v-if="data.solution.quick_recovery?.length" class="solution-section">
+                        <span class="section-label success">快速恢复：</span>
+                        <ol class="solution-steps">
+                          <li v-for="(s, idx) in data.solution.quick_recovery" :key="idx">{{ s }}</li>
+                        </ol>
+                      </div>
+                      <div v-if="data.solution.thorough_fix?.length" class="solution-section">
+                        <span class="section-label primary">彻底修复：</span>
+                        <ol class="solution-steps">
+                          <li v-for="(s, idx) in data.solution.thorough_fix" :key="idx">{{ s }}</li>
+                        </ol>
+                      </div>
+                    </div>
+                  </div>
+                </template>
+              </el-tree>
+            </template>
+            <el-empty v-else-if="!viewTreeLoading" description="决策树数据加载失败" />
+          </div>
+        </div>
+        <!-- 无决策树时的提示 -->
+        <el-alert v-else type="info" :closable="false" show-icon style="margin-top:16px">
+          <template #title>决策树说明</template>
+          该文档尚未发布或决策树解析失败，请先点击「发布」按钮生成决策树。
         </el-alert>
       </template>
       <template #footer>
@@ -680,7 +892,7 @@ onMounted(() => {
     <el-dialog v-model="importDialogVisible" title="导入 SOP 文档" width="520px">
       <el-alert type="info" :closable="false" style="margin-bottom:16px">
         <template #title>导入说明</template>
-        上传 Word（.docx）或 Markdown（.md）文档，系统自动按章节标题分块。导入后状态为「草稿」，需手动点击「发布」后 AI 才可搜索引用。相同文件（SHA256）不会重复导入。
+        上传 Word（.docx）或 Markdown（.md）文档。导入后状态为「草稿」，需手动点击「发布」后生成决策树，AI 才可搜索引用。相同文件（SHA256）不会重复导入。
       </el-alert>
       <el-form label-width="90px">
         <el-form-item label="文档文件" required>
@@ -730,7 +942,7 @@ onMounted(() => {
 .doc-id { color: #909399; font-family: monospace; font-size: 13px; }
 .doc-title { color: #303133; line-height: 1.5; }
 .category-tag { font-size: 12px; color: #909399; background: #f5f7fa; padding: 2px 6px; border-radius: 3px; }
-.chunk-count { font-family: monospace; font-size: 13px; color: #606266; }
+.node-count { font-family: monospace; font-size: 13px; color: #606266; }
 .date-text { font-size: 13px; color: #606266; }
 .text-muted { color: #c0c4cc; font-size: 13px; }
 .pagination-wrapper { display: flex; justify-content: flex-end; margin-top: 16px; }
@@ -781,5 +993,171 @@ onMounted(() => {
   background: #fff;
   overflow: auto;
   tab-size: 2;
+}
+
+/* 决策树可视化 */
+.tree-section {
+  border: 1px solid #e4e7ed;
+  border-radius: 4px;
+  margin-top: 16px;
+  background: #fafafa;
+}
+.tree-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px 16px;
+  border-bottom: 1px solid #e4e7ed;
+  background: #f5f7fa;
+}
+.tree-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: #303133;
+}
+.tree-actions {
+  display: flex;
+  gap: 4px;
+}
+.tree-container {
+  max-height: 480px;
+  overflow-y: auto;
+  padding: 12px;
+}
+.tree-node-content {
+  padding: 8px 4px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.node-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+}
+.node-level {
+  font-family: monospace;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 3px;
+  background: #e6f7ff;
+  color: #1890ff;
+}
+.node-level.level-1 { background: #f6ffed; color: #52c41a; }
+.node-level.level-2 { background: #fffbe6; color: #faad14; }
+.node-level.level-3 { background: #fff1f0; color: #f5222d; }
+.node-level.level-4 { background: #f9f0ff; color: #722ed1; }
+.node-title {
+  font-weight: 500;
+  color: #303133;
+  flex: 1;
+}
+.node-type-tag {
+  margin-left: 4px;
+}
+.node-line {
+  font-family: monospace;
+  font-size: 11px;
+  color: #909399;
+  margin-left: 8px;
+}
+.node-prerequisites {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #f5f7fa;
+  border-radius: 3px;
+}
+.section-label {
+  font-size: 12px;
+  color: #606266;
+  font-weight: 500;
+  margin-right: 6px;
+}
+.prerequisite-list {
+  margin-top: 4px;
+}
+.prerequisite-item {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+.prerequisite-desc {
+  color: #303133;
+  font-size: 13px;
+}
+.node-diagnosis {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #e6f7ff;
+  border-radius: 3px;
+  border-left: 3px solid #1890ff;
+}
+.diagnosis-section {
+  margin-bottom: 6px;
+}
+.method-list {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  list-style: disc;
+}
+.method-list li {
+  margin-bottom: 2px;
+}
+.method-list code {
+  font-family: 'SFMono-Regular', Consolas, monospace;
+  background: #f0f0f0;
+  padding: 1px 4px;
+  border-radius: 2px;
+  font-size: 12px;
+  color: #1890ff;
+}
+.method-list .page-method {
+  list-style: circle;
+}
+.method-type {
+  font-size: 12px;
+  color: #909399;
+  margin-right: 4px;
+}
+.causes-section {
+  margin-top: 8px;
+}
+.cause-list {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+  list-style: square;
+}
+.cause-list li {
+  margin-bottom: 2px;
+  color: #606266;
+}
+.node-solution {
+  margin-top: 6px;
+  padding: 6px 10px;
+  background: #f6ffed;
+  border-radius: 3px;
+  border-left: 3px solid #52c41a;
+}
+.solution-section {
+  margin-bottom: 8px;
+}
+.solution-section:last-child {
+  margin-bottom: 0;
+}
+.section-label.success {
+  color: #52c41a;
+}
+.section-label.primary {
+  color: #409eff;
+}
+.solution-steps {
+  margin: 4px 0 0 0;
+  padding-left: 20px;
+}
+.solution-steps li {
+  margin-bottom: 4px;
+  color: #303133;
 }
 </style>
