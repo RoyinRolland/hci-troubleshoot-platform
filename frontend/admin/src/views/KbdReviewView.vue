@@ -2,6 +2,8 @@
 import { ref, onMounted } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { useCategories } from '../composables/useCategories'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
 
 // ──────────────────────────────────────────────────────────────────────────────
 // 类型定义
@@ -366,83 +368,13 @@ async function handleRepublish(entry: KbdEntry) {
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
-// Markdown 渲染（修复 ol/ul 状态混乱 + 缩进子列表）
+// Markdown 渲染（基于标准 AST 词法状态机解析与防注入过滤，彻底告别手写正则妥协）
 // ──────────────────────────────────────────────────────────────────────────────
 function renderMarkdown(md: string): string {
   if (!md) return ''
-  const lines = md.split('\n')
-  const html: string[] = []
-  let listType: 'none' | 'ul' | 'ol' = 'none'
-  let inBlockquote = false
-
-  const flushList = () => {
-    if (listType === 'ul') { html.push('</ul>'); listType = 'none' }
-    else if (listType === 'ol') { html.push('</ol>'); listType = 'none' }
-  }
-  const flushBlockquote = () => {
-    if (inBlockquote) { html.push('</blockquote>'); inBlockquote = false }
-  }
-
-  for (const line of lines) {
-    if (line.startsWith('## ')) {
-      flushList(); flushBlockquote()
-      html.push(`<h3 class="md-h2">${escapeHtml(line.slice(3))}</h3>`)
-      continue
-    }
-    if (line.startsWith('### ')) {
-      flushList(); flushBlockquote()
-      html.push(`<h4 class="md-h3">${escapeHtml(line.slice(4))}</h4>`)
-      continue
-    }
-    if (line.startsWith('> ')) {
-      flushList()
-      if (!inBlockquote) { html.push('<blockquote class="md-blockquote">'); inBlockquote = true }
-      html.push(`<p>${inlineRender(line.slice(2))}</p>`)
-      continue
-    }
-    // 无序列表（含 2+ 空格缩进的子项）
-    const ulMatch = line.match(/^(\s*)[-*]\s+(.+)$/)
-    if (ulMatch) {
-      flushBlockquote()
-      if (listType !== 'ul') { flushList(); html.push('<ul class="md-list">'); listType = 'ul' }
-      const indentPx = ulMatch[1].length * 10
-      const style = indentPx > 0 ? ` style="margin-left:${indentPx}px"` : ''
-      html.push(`<li${style}>${inlineRender(ulMatch[2])}</li>`)
-      continue
-    }
-    // 有序列表（中文 1、 或英文 1. 开头）
-    const olMatch = line.match(/^(\s*)\d+[.、]\s+(.+)$/)
-    if (olMatch) {
-      flushBlockquote()
-      if (listType !== 'ol') { flushList(); html.push('<ol class="md-list">'); listType = 'ol' }
-      html.push(`<li>${inlineRender(olMatch[2])}</li>`)
-      continue
-    }
-    flushList(); flushBlockquote()
-    if (line.trim() === '') {
-      // 跳过多余空行，段间距由 CSS 控制
-    } else {
-      html.push(`<p class="md-p">${inlineRender(line)}</p>`)
-    }
-  }
-  flushList(); flushBlockquote()
-  return html.join('\n')
-}
-
-function inlineRender(text: string): string {
-  return escapeHtml(text)
-    .replace(/\\_/g, '_')  // 处理 Markdown 转义下划线
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
-    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
-}
-
-function escapeHtml(s: string): string {
-  return s
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
+  // 使用完备的 AST 语法分析器 marked 解析 Markdown 为标准 HTML
+  // 并使用 DOMPurify 彻底进行过滤防御 XSS 攻击
+  return DOMPurify.sanitize(marked.parse(md) as string)
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -946,7 +878,7 @@ onMounted(() => {
         <!-- 案例 ID -->
         <el-table-column label="案例 ID" width="100">
           <template #default="{ row }">
-            <a :href="makeSupportUrl(row.support_id)" target="_blank" class="support-link">
+            <a :href="makeSupportUrl(row.support_id)" target="_blank" rel="noopener noreferrer" class="support-link">
               {{ row.support_id }}
             </a>
           </template>
@@ -1044,7 +976,7 @@ onMounted(() => {
         <!-- 基本信息 -->
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="案例 ID">
-            <a :href="makeSupportUrl(detailEntry.support_id)" target="_blank" class="support-link">
+            <a :href="makeSupportUrl(detailEntry.support_id)" target="_blank" rel="noopener noreferrer" class="support-link">
               {{ detailEntry.support_id }}
               <el-icon style="font-size: 11px; margin-left: 3px"><Link /></el-icon>
             </a>
@@ -1480,7 +1412,8 @@ onMounted(() => {
   color: #303133;
 }
 
-.md-render :deep(.md-h2) {
+.md-render :deep(.md-h2),
+.md-render :deep(h2) {
   font-size: 16px;
   font-weight: 700;
   color: #1a1a2e;
@@ -1489,18 +1422,21 @@ onMounted(() => {
   border-bottom: 2px solid #409eff22;
 }
 
-.md-render :deep(.md-h3) {
+.md-render :deep(.md-h3),
+.md-render :deep(h3) {
   font-size: 14px;
   font-weight: 600;
   color: #303133;
   margin: 12px 0 6px;
 }
 
-.md-render :deep(.md-p) {
+.md-render :deep(.md-p),
+.md-render :deep(p) {
   margin: 4px 0;
 }
 
-.md-render :deep(.md-blockquote) {
+.md-render :deep(.md-blockquote),
+.md-render :deep(blockquote) {
   background: #f0f9ff;
   border-left: 4px solid #409eff;
   border-radius: 0 4px 4px 0;
@@ -1510,12 +1446,15 @@ onMounted(() => {
   font-size: 13px;
 }
 
-.md-render :deep(.md-list) {
+.md-render :deep(.md-list),
+.md-render :deep(ul),
+.md-render :deep(ol) {
   margin: 6px 0 6px 20px;
   padding: 0;
 }
 
-.md-render :deep(.md-list li) {
+.md-render :deep(.md-list li),
+.md-render :deep(li) {
   margin: 3px 0;
 }
 

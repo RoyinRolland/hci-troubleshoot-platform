@@ -30,6 +30,44 @@ from sqlalchemy import BigInteger, Column, DateTime, Float, Integer, String, Tex
 from sqlalchemy.dialects.postgresql import JSONB
 
 
+def strip_markdown(text: str) -> str:
+    """去除 Markdown 语法标记和图片占位符，返回干净纯净的纯文本内容。
+
+    注意：保留代码块和行内代码的内容，仅移除语法标记。
+    保留标识符中的下划线和星号（如 os_type, file_name）。
+    """
+    if not text:
+        return ""
+    # 1. 移除图片占位符和图片标记 (e.g. ![img:0], ![无描述])
+    text = re.sub(r'!\[img:\d+\]', '', text)
+    text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
+    text = re.sub(r'> \*\*【截图说明】\*\*.*', '', text) # 移除截图说明提示行
+    # 2. 移除普通链接格式 [text](url)，仅保留文本部分
+    text = re.sub(r'\[(.*?)\]\(.*?\)', r'\1', text)
+    # 3. 移除 HTML 标签
+    text = re.sub(r'<[^>]*>', '', text)
+    # 4. 移除粗体/斜体语法界定符（仅匹配成对的 ** __ * _，保留标识符中的字符）
+    #    先处理多字符界定符（避免部分匹配问题）
+    text = re.sub(r'\*\*(.+?)\*\*', r'\1', text)  # **text** → text
+    text = re.sub(r'__(.+?)__', r'\1', text)      # __text__ → text
+    text = re.sub(r'\*(.+?)\*', r'\1', text)      # *text* → text（单星号斜体）
+    text = re.sub(r'_(.+?)_', r'\1', text)        # _text_ → text（单下划线斜体）
+    # 5. 移除标题标志 (e.g. ## 问题描述)
+    text = re.sub(r'^#+\s+', '', text, flags=re.MULTILINE)
+    # 6. 移除引用块前导符 (> )
+    text = re.sub(r'^>\s*', '', text, flags=re.MULTILINE)
+    # 7. 移除代码块 fence 标记，保留代码内容（```...``` → 内部代码）
+    text = re.sub(r'^```.*$', '', text, flags=re.MULTILINE)  # 移除 ``` 行
+    text = re.sub(r'`([^`]+)`', r'\1', text)       # `code` → code（保留内容）
+    # 8. 移除无序列表和有序列表前导符 (-, *, +, \d+.)
+    text = re.sub(r'^[-*+]\s+', '', text, flags=re.MULTILINE)
+    text = re.sub(r'^\d+\.\s+', '', text, flags=re.MULTILINE)
+    # 9. 规范化并清洗多余空白字符与换行
+    text = re.sub(r'\n+', '\n', text)
+    text = re.sub(r'[ \t]+', ' ', text)
+    return text.strip()
+
+
 class KbdEntry(Base):
     """KBD 知识条目模型
 
@@ -84,6 +122,7 @@ class KbdEntry(Base):
     # admin 编辑章节后由 rebuild_content_md() 重建（从章节字段+images_json 生成）
     # 注意：embedding 不使用此字段，embedding 使用问题侧字段（见 SECTION_FIELDS_FOR_EMBEDDING）
     content_md = Column(Text, nullable=True)                            # 聚合渲染 Markdown
+    content_raw = Column(Text, nullable=True)                           # 纯文本去噪内容
 
     # 使用 entry_metadata 作为 Python 属性名，"metadata" 作为数据库列名
     # 避免 SQLAlchemy Base.metadata 保留属性冲突
