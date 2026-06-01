@@ -20,6 +20,7 @@ OpsAgentAdapter：ops-agent ACP 客户端适配器（方案E实现）
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -36,6 +37,7 @@ from app.domain.agent_port import (
     AgentTextChunk,
     AgentUnavailableError,
 )
+from app.services.prompt_audit import PromptAuditService
 
 logger = logging.getLogger("ops-agent-brain-adapter")
 
@@ -91,6 +93,15 @@ class OpsAgentAdapter:
         Raises:
             AgentUnavailableError: ops-agent 服务不可达或返回非 2xx 状态码。
         """
+        # 写入 100% 全量原始 Prompt 审计
+        asyncio.create_task(
+            PromptAuditService.write_prompt_audit(
+                conversation_id=session_id,
+                assistant_type="ops-agent",
+                messages=messages,
+            )
+        )
+
         headers: dict[str, str] = {"Content-Type": "application/json"}
         if self._api_key:
             headers["Authorization"] = f"Bearer {self._api_key}"
