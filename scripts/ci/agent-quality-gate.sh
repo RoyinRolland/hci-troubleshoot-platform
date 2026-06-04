@@ -30,7 +30,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 # ---- 项目根目录 ----
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$PROJECT_ROOT"
 
 # ---- 计数器 ----
@@ -38,14 +38,8 @@ PASS=0
 FAIL=0
 SKIP=0
 
-# ---- 加载 VK 工作流钩子 ----
-VK_HOOKS="${PROJECT_ROOT}/scripts/vk-hooks.sh"
-if [ -f "$VK_HOOKS" ]; then
-    source "$VK_HOOKS"
-fi
-
 # ---- 报告文件 ----
-REPORT_DIR="${PROJECT_ROOT}/.vk/reports"
+REPORT_DIR="${PROJECT_ROOT}/build/reports"
 mkdir -p "$REPORT_DIR"
 REPORT_FILE="${REPORT_DIR}/quality-gate-$(date +%Y%m%d-%H%M%S).txt"
 
@@ -264,15 +258,15 @@ detect_changes() {
         changed+=$(git diff --name-only --cached 2>/dev/null || true)
     fi
 
-    while IFS= read -r f; do
+    while IFS= read -r f || [ -n "$f" ]; do
         [[ -z "$f" ]] && continue
-        [[ "$f" == *.py ]] && HAS_PYTHON_CHANGES=true
+        [[ "$f" == *.py ]] && HAS_PYTHON_CHANGES=true || true
         [[ "$f" == frontend/* || "$f" == *.ts || "$f" == *.vue || "$f" == *.tsx || "$f" == *.jsx ]] \
-            && HAS_FRONTEND_CHANGES=true
+            && HAS_FRONTEND_CHANGES=true || true
         [[ "$f" == *.js || "$f" == *.ts || "$f" == *.tsx || "$f" == *.jsx || "$f" == package.json ]] \
-            && HAS_NODEJS_CHANGES=true
-        [[ "$f" == *.go || "$f" == go.mod || "$f" == go.sum ]] && HAS_GO_CHANGES=true
-        [[ "$f" == *.rs || "$f" == Cargo.toml || "$f" == Cargo.lock ]] && HAS_RUST_CHANGES=true
+            && HAS_NODEJS_CHANGES=true || true
+        [[ "$f" == *.go || "$f" == go.mod || "$f" == go.sum ]] && HAS_GO_CHANGES=true || true
+        [[ "$f" == *.rs || "$f" == Cargo.toml || "$f" == Cargo.lock ]] && HAS_RUST_CHANGES=true || true
     done <<< "$changed"
 }
 
@@ -724,11 +718,13 @@ main() {
 
     if [ $FAIL -gt 0 ]; then
         echo -e "\n  ${RED}质量门禁未通过！${NC}"
-        type vk_on_cleanup_failure &>/dev/null && vk_on_cleanup_failure
         exit 1
     else
         echo -e "\n  ${GREEN}质量门禁全部通过 ✓${NC}"
-        type vk_on_cleanup_success &>/dev/null && vk_on_cleanup_success
+        if [ -f "scripts/archive_artifacts.sh" ]; then
+            log_header "自动归档 Gemini/Claude 规划与任务文档"
+            bash scripts/archive_artifacts.sh
+        fi
         exit 0
     fi
 }

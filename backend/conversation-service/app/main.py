@@ -18,7 +18,16 @@ from shared.observability.otel import init_telemetry, instrument_app
 from shared.utils.exception_handlers import register_exception_handlers
 
 from app.config import settings
-from app.routes import agent_exec, conversations, diagnostic_item, evaluate, sop_execution
+from app.routes import (
+    agent_exec,
+    conversations,
+    diagnostic_item,
+    evaluate,
+    skill_definition,
+    sop_execution,
+    system_prompt,
+    tool_definition,
+)
 from app.routes import audit as audit_route
 from app.services.agent_client import AgentClient
 from app.services.environment_client import EnvironmentClient
@@ -128,9 +137,12 @@ async def lifespan(app: FastAPI):
     )
     evaluate.set_database_manager(database_manager)
     audit_route.set_audit_database_manager(database_manager)
-    sop_execution.set_dependencies(database_manager)
+    sop_execution.set_dependencies(database_manager, kb_client, environment_client)
     diagnostic_item.set_dependencies(database_manager)
     agent_exec.set_dependencies(database_manager, redis_manager)  # T-TOOL-05, T-TOOL-06
+    tool_definition.set_tool_database_manager(database_manager)
+    system_prompt.set_prompt_database_manager(database_manager)
+    skill_definition.set_skill_database_manager(database_manager)
 
     yield
 
@@ -165,6 +177,9 @@ app.include_router(audit_route.router)
 app.include_router(sop_execution.router)
 app.include_router(diagnostic_item.router)
 app.include_router(agent_exec.router)  # T-TOOL-05, T-TOOL-06
+app.include_router(tool_definition.router)
+app.include_router(system_prompt.router)
+app.include_router(skill_definition.router)
 
 
 # 健康检查端点
@@ -186,6 +201,7 @@ async def health_check():
     kb_client = getattr(app.state, "kb_client", None)
     if kb_client:
         import httpx
+
         try:
             async with httpx.AsyncClient(timeout=0.5) as client:
                 resp = await client.get(f"{settings.KB_SERVICE_URL}/health")
@@ -245,6 +261,7 @@ async def health_ready():
     kb_client = getattr(app.state, "kb_client", None)
     if kb_client:
         import httpx
+
         try:
             async with httpx.AsyncClient(timeout=1.0) as client:
                 resp = await client.get(f"{settings.KB_SERVICE_URL}/health")

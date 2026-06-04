@@ -25,6 +25,7 @@ from shared.clients import KBClient
 from shared.observability.logger import get_logger
 
 from app.memory.variable_pool.pool import VariableRequestResult
+from app.skills.registry import execute_skill
 
 logger = get_logger("memory.variable-pool")
 
@@ -178,14 +179,16 @@ async def sop_request_variable(
         acquisition_tool=acquisition_tool,
     )
 
-    if strategy == "env_injection":
-        # env_injection 类变量应在初始化阶段批量注入，不走 JIT 流程
-        return {
-            "error": (
-                f"变量 {variable_name} 类型为 env_injection，"
-                "应在 SOP 初始化阶段从环境上下文批量注入，无需调用此工具"
-            ),
-        }
+    if strategy in ("env_injection", "env_context"):
+        # env_injection 类变量应在初始化阶段批量注入，如果不小心漏掉了或解析失败，
+        # 我们在此处记录 warning 并降级为 user_input 策略，避免系统崩溃。
+        logger.warning(
+            event="sop_request_variable_env_injection_missing",
+            message=f"变量 {variable_name} 策略为 {strategy} 但在 context_variables 中未找到值，降级为 user_input",
+            variable_name=variable_name,
+            conversation_id=conversation_id,
+        )
+        strategy = "user_input"
 
     if strategy == "sop_default":
         # sop_default 类变量：直接读 variable_schema.default_value，无需用户输入或工具调用
@@ -278,6 +281,32 @@ async def sop_request_variable(
             msg=f"变量 {variable_name} 自动获取失败，请手动输入",
         )
 
+    if strategy == "skill_call" and acquisition_tool:
+        # skill_call 策略：执行内置通用分析技能计算变量值
+        try:
+            skill_result = await execute_skill(acquisition_tool, context_variables)
+            if skill_result is not None:
+                logger.info(
+                    event="sop_request_variable_skill_executed",
+                    variable_name=variable_name,
+                    acquisition_skill=acquisition_tool,
+                    result=skill_result,
+                )
+                return {"ok": True, "value": skill_result, "source": "skill_call"}
+        except Exception as exc:
+            logger.warning(
+                event="sop_request_variable_skill_failed",
+                variable_name=variable_name,
+                acquisition_skill=acquisition_tool,
+                error=str(exc),
+            )
+        # 降级：技能执行失败，请用户手动输入
+        return await _request_user_input(
+            var_schema=var_def,
+            kind="variable_input",
+            msg=f"变量 {variable_name} 自动分析失败，请手动输入",
+        )
+
     if strategy == "user_confirm":
         # user_confirm 策略：先调用工具获取候选值，再展示给用户确认
         options: list[dict] = []
@@ -285,14 +314,9 @@ async def sop_request_variable(
             try:
                 candidates_result = await tool_executor.execute(acquisition_tool, {})
                 if isinstance(candidates_result, list):
-                    options = [
-                        {"label": str(item), "value": item} for item in candidates_result
-                    ]
+                    options = [{"label": str(item), "value": item} for item in candidates_result]
                 elif isinstance(candidates_result, dict) and "items" in candidates_result:
-                    options = [
-                        {"label": str(item), "value": item}
-                        for item in candidates_result["items"]
-                    ]
+                    options = [{"label": str(item), "value": item} for item in candidates_result["items"]]
                 logger.info(
                     event="sop_request_variable_confirm_candidates",
                     variable_name=variable_name,

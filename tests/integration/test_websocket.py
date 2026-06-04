@@ -23,6 +23,11 @@ if _expect != _actual:
     for _k in list(sys.modules):
         if _k == "app" or _k.startswith("app."):
             del sys.modules[_k]
+    try:
+        from shared.database.postgres import Base
+        Base.metadata.clear()
+    except ImportError:
+        pass
     if _svc in sys.path:
         sys.path.remove(_svc)
     sys.path.insert(0, _svc)
@@ -64,6 +69,7 @@ def mock_redis_manager(redis_client):
 def session_manager(mock_redis_manager):
     """使用 fakeredis 的 SessionManager"""
     from app.services.session import SessionManager
+
     return SessionManager(mock_redis_manager)
 
 
@@ -200,11 +206,15 @@ class TestWebSocketEndpoint:
                 MockClient.return_value = mock_client_instance
 
                 with client.websocket_connect("/ws/test-client-2") as ws:
-                    ws.send_text(json.dumps({
-                        "type": "message",
-                        "conversation_id": "conv-test-123",
-                        "content": "测试消息",
-                    }))
+                    ws.send_text(
+                        json.dumps(
+                            {
+                                "type": "message",
+                                "conversation_id": "conv-test-123",
+                                "content": "测试消息",
+                            }
+                        )
+                    )
                     # 接收并检查任意响应（下游不可用时不强制要求回传）
                     with contextlib.suppress(Exception):
                         _ = ws.receive_text(timeout=2)
@@ -215,4 +225,4 @@ class TestWebSocketEndpoint:
             ws.send_text("not json at all !!!!")
             # 连接应保持活跃，继续发送合法消息不报错
             ws.send_text(json.dumps({"ping": True}))
-                # 如无响应也正常（invalid json 会被 continue 跳过）
+            # 如无响应也正常（invalid json 会被 continue 跳过）
