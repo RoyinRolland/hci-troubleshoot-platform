@@ -16,11 +16,13 @@ conversation-service 通过此客户端将推理请求委托给 agent-service，
 from __future__ import annotations
 
 import json
+import secrets
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import httpx
 from shared.observability.logger import get_logger
+from shared.observability.otel import get_current_trace_id
 
 logger = get_logger("agent_client")
 
@@ -82,8 +84,16 @@ class AgentClient:
             session_id=session_id,
         )
 
+        # 强行注入 traceparent 头以避免 Starlette streaming 异步迭代器中 ContextVars 丢失导致 Trace 分叉
+        active_trace_id = get_current_trace_id() or secrets.token_hex(16)
+        span_id = secrets.token_hex(8)
+        headers = {
+            "traceparent": f"00-{active_trace_id}-{span_id}-01",
+            "Content-Type": "application/json"
+        }
+
         try:
-            async with httpx.AsyncClient(timeout=None) as client, client.stream("POST", url, json=payload) as resp:
+            async with httpx.AsyncClient(timeout=None) as client, client.stream("POST", url, json=payload, headers=headers) as resp:
                 if resp.status_code != 200:
                     body = await resp.aread()
                     logger.error(
