@@ -108,9 +108,9 @@ class ConversationService:
         case_trace_id = None
         try:
             from sqlalchemy import text
+
             res = await self.repository.session.execute(
-                text('SELECT trace_id FROM "case" WHERE case_id = :case_id'),
-                {"case_id": case_id}
+                text('SELECT trace_id FROM "case" WHERE case_id = :case_id'), {"case_id": case_id}
             )
             case_row = res.fetchone()
             if case_row:
@@ -192,16 +192,12 @@ class ConversationService:
                     trace_id=int(target_trace_id, 16),
                     span_id=trace.generate_span_id(),
                     is_remote=True,
-                    trace_flags=TraceFlags(0x01)
+                    trace_flags=TraceFlags(0x01),
                 )
                 parent_span = NonRecordingSpan(span_context)
                 ctx = trace.set_span_in_context(parent_span)
             except Exception as e:
-                logger.warning(
-                    event="failed_to_build_otel_span_context",
-                    target_trace_id=target_trace_id,
-                    error=str(e)
-                )
+                logger.warning(event="failed_to_build_otel_span_context", target_trace_id=target_trace_id, error=str(e))
 
         token = None
         if ctx:
@@ -318,20 +314,37 @@ class ConversationService:
             # 2.6 【修复】获取环境上下文信息（Segment 4 数据）
             context_info: dict | None = None
             if current_stage == "S0" and self.environment_client:
-                env_context = await self.environment_client.get_context_info(case_id)
-                if env_context:
-                    context_info = {
-                        "env_info": env_context.env_info,
-                        "alert_logs": env_context.alert_logs,
-                        "task_logs": env_context.task_logs,
-                    }
-                    logger.info(
-                        event="s0_context_info_loaded",
-                        message="S0 环境上下文已加载",
-                        case_id=case_id,
-                        alert_count=len(env_context.alert_logs),
-                        task_count=len(env_context.task_logs),
-                    )
+                if settings.USE_RAW_ENVIRONMENT_CONTEXT:
+                    raw_envs = await self.environment_client.get_raw_environments(case_id)
+                    if raw_envs:
+                        context_info = {
+                            "is_raw": True,
+                            "env_info": raw_envs.get("cluster", {}),
+                            "alert_logs": raw_envs.get("alert", {}).get("alerts", []),
+                            "task_logs": raw_envs.get("task", {}).get("tasks", []),
+                        }
+                        logger.info(
+                            event="s0_raw_context_info_loaded",
+                            message="S0 原始环境上下文已加载",
+                            case_id=case_id,
+                            alert_count=len(context_info["alert_logs"]),
+                            task_count=len(context_info["task_logs"]),
+                        )
+                else:
+                    env_context = await self.environment_client.get_context_info(case_id)
+                    if env_context:
+                        context_info = {
+                            "env_info": env_context.env_info,
+                            "alert_logs": env_context.alert_logs,
+                            "task_logs": env_context.task_logs,
+                        }
+                        logger.info(
+                            event="s0_context_info_loaded",
+                            message="S0 环境上下文已加载",
+                            case_id=case_id,
+                            alert_count=len(env_context.alert_logs),
+                            task_count=len(env_context.task_logs),
+                        )
 
             # 3. 获取历史上下文 (最近 20 条)
             # 注意：必须使用独立 session，避免请求作用域 session 在流式传输期间长期持有事务锁
@@ -414,6 +427,9 @@ class ConversationService:
                             _stage = agent_event.get("stage", "")
                             _metadata = agent_event.get("metadata", {})
                             yield f"\x00event:stage_change:{_stage}\x00"
+                            if _stage in ("tool_call", "tool_result"):
+                                _payload = _json.dumps(_metadata, ensure_ascii=False)
+                                yield f"\x00event:{_stage}:{_payload}\x00"
                             # T-AGT-07: 处理 SOP 命中统计（sop_reasoning 事件携带 sop_document_id）
                             if _stage == "sop_reasoning" and _metadata.get("sop_document_id"):
                                 _sop_doc_id = _metadata.get("sop_document_id")
@@ -507,7 +523,9 @@ class ConversationService:
                     ai_client = self.ai_registry.get_client(resolved_assistant_type)
                     if not ai_client:
                         error_msg = f"未找到类型为 '{resolved_assistant_type}' 的 AI 助手"
-                        logger.error(event="ai_client_not_found", message=error_msg, assistant_type=resolved_assistant_type)
+                        logger.error(
+                            event="ai_client_not_found", message=error_msg, assistant_type=resolved_assistant_type
+                        )
                         yield f"\n[System Error: {error_msg}]"
                         return
 
@@ -531,7 +549,9 @@ class ConversationService:
                                     conversation_id=str(conversation_id),
                                 )
                                 # 记录首 Token 延迟到 Prometheus histogram
-                                AI_TTFT_SECONDS.labels(assistant_type=resolved_assistant_type).observe(_ttft_ms / 1000.0)
+                                AI_TTFT_SECONDS.labels(assistant_type=resolved_assistant_type).observe(
+                                    _ttft_ms / 1000.0
+                                )
                                 _ttft_logged = True
                             _full_reply_buffer.append(chunk)
                             yield chunk
@@ -2005,21 +2025,24 @@ class ConversationService:
         request_id: str,
         acp_session_id: str,
         outcome: dict,
+        metadata: dict | None = None,
     ) -> bool:
         """T-E6 + T-AGT-03: 将用户对交互卡片的响应回传给 agent-service。
 
         按 kind 字段分叉路由：
         - kind=tool_confirm → 调用 agent-service /v1/agent/react-confirm（ReAct 确认回路）
+        - kind=variable_input/variable_confirm → 写入 SOP 变量池（HTP 排障）
         - 其他 kind（ACP 类型）→ 调用 agent-service /v1/agent/interactive-response（ops-agent ACP）
 
         Args:
             conversation_id: 对话 ID（用于日志追踪）。
-            kind:            交互类型（tool_confirm / sop_step / info_confirm 等）。
+            kind:            交互类型（tool_confirm / sop_step / info_confirm / variable_input 等）。
             request_id:      ACP request_id（来自 AgentInteractiveRequest.request_id）。
             acp_session_id:  ops-agent ACP session_id（来自 AgentInteractiveRequest.acp_session_id）。
             outcome:         提交结果，格式 {"outcome": "selected", "optionId": "A"}
                              或 {"outcome": "free_text", "text": "..."}
                              或 {"confirmed": true, "authorized_by": "user"}（tool_confirm）。
+            metadata:        可选元数据（包含变量名等）。
 
         Returns:
             True  = 提交成功；False = AgentClient 未注入或请求失败。
@@ -2037,7 +2060,89 @@ class ConversationService:
         session_id = str(conversation_id)
 
         # 按 kind 分叉路由
-        if kind == "tool_confirm":
+        if kind in ("variable_input", "variable_confirm"):
+            # ── SOP 变量输入/确认路径 ──
+            if not metadata or "variable_name" not in metadata:
+                logger.warning(
+                    event="sop_variable_response_missing_metadata",
+                    message="SOP 变量提交缺少 metadata 或 variable_name",
+                    conversation_id=str(conversation_id),
+                    kind=kind,
+                )
+                return False
+
+            variable_name = metadata["variable_name"]
+            value = None
+            if outcome.get("outcome") == "free_text":
+                value = outcome.get("text")
+            elif outcome.get("outcome") == "selected":
+                value = outcome.get("optionLabel") or outcome.get("optionId")
+            else:
+                value = outcome.get("value") or outcome.get("text")
+
+            if value is None:
+                logger.warning(
+                    event="sop_variable_response_missing_value",
+                    message="SOP 变量提交缺少值",
+                    conversation_id=str(conversation_id),
+                    variable_name=variable_name,
+                )
+                return False
+
+            if self.session_factory:
+                async with self.session_factory() as session:
+                    repo = SopExecutionRepository(session)
+                    updated = await repo.set_variable(
+                        conversation_id=conversation_id,
+                        variable_name=variable_name,
+                        value=str(value),
+                        source="user_input",
+                    )
+                    if updated:
+                        await session.commit()
+                        logger.info(
+                            event="sop_variable_submitted_via_interactive",
+                            message="SOP 变量已通过交互卡片写入",
+                            conversation_id=str(conversation_id),
+                            variable_name=variable_name,
+                            value=value,
+                        )
+                        # 将用户的弹框选择/输入以 user 角色落库，供历史记录查看
+                        try:
+                            conv = await self.repository.get_conversation(conversation_id)
+                            if conv:
+                                await self.repository.add_message(
+                                    conversation_id=conversation_id,
+                                    case_id=conv.case_id,
+                                    role=MessageRole.user,
+                                    content=self._format_interactive_response_content(outcome),
+                                    metadata={
+                                        "kind": "interactive_response",
+                                        "selectedOptionId": outcome.get("optionId")
+                                        if outcome.get("outcome") == "selected"
+                                        else None,
+                                    },
+                                )
+                        except Exception as msg_err:
+                            logger.warning(f"SOP 变量提交写入 user 消息失败: {msg_err}")
+                        return True
+                    else:
+                        logger.warning(
+                            event="sop_variable_submit_no_execution",
+                            message="SOP 变量提交失败：未找到对应的 SOP 执行实例",
+                            conversation_id=str(conversation_id),
+                            variable_name=variable_name,
+                        )
+                        return False
+            else:
+                logger.warning(
+                    event="sop_variable_submit_no_session_factory",
+                    message="SOP 变量提交失败：session_factory 未注入",
+                    conversation_id=str(conversation_id),
+                )
+                return False
+
+        elif kind == "tool_confirm":
             # ── ReAct 确认回路（T-AGT-03）────────────────────────────────────────────
             confirmed = bool(outcome.get("confirmed", False))
             authorized_by = outcome.get("authorized_by", "user")
@@ -2196,6 +2301,10 @@ class ConversationService:
                     )
             elif event_type == "stage_update":
                 _stage = agent_event.get("stage", "")
+                _metadata = agent_event.get("metadata", {})
                 yield f"\x00event:stage_change:{_stage}\x00"
+                if _stage in ("tool_call", "tool_result"):
+                    _payload = _json.dumps(_metadata, ensure_ascii=False)
+                    yield f"\x00event:{_stage}:{_payload}\x00"
             elif event_type == "done":
                 break

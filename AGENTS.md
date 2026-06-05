@@ -92,6 +92,17 @@
   - 修复变量池 `sop_request_variable` 获取策略判定逻辑，支持并正确识别 `env:xxx` 格式的环境变量注入策略。
 - **SOP 工具执行器参数适配修复**：
   - 修复 `SopToolExecutor.execute` 签名缺少 `**kwargs` 导致在 ReAct 循环中被调用时抛出 `TypeError: got an unexpected keyword argument 'conversation_id'`，彻底解决工具调用通道报错阻断的问题。
+- **SOP 交互变量值提交失效问题修复**：
+  - 修复前端 `MessageBubble.vue` 和 `InteractiveRequestCard.vue` 提交 `interactive-response` 时缺失 `kind` 和 `metadata` 导致路由错误的问题。
+  - 在后端 `submit_interactive_response` 增加针对 `variable_input`/`variable_confirm` 的处理，直接将变量写入 SOP 变量库中，并恢复执行状态为 `active`。
+  - 前端接收到变量提交流程成功后，自动调用 `sendMessage` 重新发送变量值，触发后端 HTP Agent 的 ReAct 推理循环从中断位置恢复继续运行。
+- **SOP 执行路由漂移与恢复稳定性修复**：
+  - 修复排障 Agent 在多轮对话中，由于用户发送的“继续”或命令回显数据与 SOP 文档内容在语义匹配上发生偏差，导致 `route_by_category` 三轨路由发生漂移、误判为非 SOP 轨道而回退到 fallback 推理模式的缺陷。
+  - 优化：当检测到活跃的 `sop_resume_context`（正在执行的 SOP）时，直接绕过三轨路由匹配，通过 document_id 获取 SOP 详情，确保 Agent 在会话周期内牢牢锁定在 SOP 导航模式中。
+- **工具调用可视化、变量交互重构与原始环境注入**：
+  - **工具调用可视化与自动执行**：后端 `react_engine.py` 在工具执行生命周期中（执行前中后）广播 `tool_call` 与 `tool_result` 阶段事件并透传统一 `exec_id`。前端支持全局“自动执行”模式选择（Off / Safe-only / Aggressive），在满足风险级别时自动回复确认。对话流中新增工具卡片，以黑底 Terminal Console 折叠渲染命令执行日志与耗时。
+  - **变量输入/确认交互重构**：将 `variable_input` 升级为行内表单，对 `validation_pattern` 正则及必填项进行失焦与实时校验，不合法时红框报错并禁用提交按钮。将 `variable_confirm` 升级为左右双栏对比，左栏一键快捷确认系统推荐值，右栏支持微调修改与实时校验。
+  - **原始环境注入与向下兼容**：后端在开启 `USE_RAW_ENVIRONMENT_CONTEXT` 时直接将数据库的原始字典/JSON 喂给 LLM 提升推理准确率。在 `sop_execution.py` 中增加 is_raw 兼容层，自动将 Unix 时间戳、状态整型、紧急度等映射为 SOP 规则可识别的语义值。
 
 ---
 

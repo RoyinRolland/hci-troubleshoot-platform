@@ -22,6 +22,7 @@ TriageAgent: S0 意图识别 Agent（继承 BaseAgent）
 
 from __future__ import annotations
 
+import json
 import re
 import time
 from collections.abc import AsyncGenerator
@@ -55,7 +56,6 @@ class IntentResult:
 # ─── Prompt 数据库化收敛已就绪 ──────────────────────────────────────────────
 
 
-
 class TriageAgent(BaseAgent):
     """S0 意图识别 Agent（继承 BaseAgent）。
 
@@ -80,11 +80,10 @@ class TriageAgent(BaseAgent):
         self._kb_client = kb_client
         if db_session_factory is None:
             from shared.utils.prompt_loader import create_mock_session_factory
+
             self._db_session_factory = create_mock_session_factory()
         else:
             self._db_session_factory = db_session_factory
-
-
 
     # ─── BaseAgent 抽象方法实现 ─────────────────────────────────────────────────
 
@@ -148,7 +147,6 @@ class TriageAgent(BaseAgent):
             env_context=env_context,
             case_id=case_id,
         )
-
 
         # 3. 获取 LLM 客户端
         ai_client = self._ai_registry.get_client(assistant_type)
@@ -313,42 +311,42 @@ class TriageAgent(BaseAgent):
         from shared.utils.prompt_loader import StrictPromptLoader
 
         async with self._db_session_factory() as session:
-            base_identity = await StrictPromptLoader.load_and_validate(
-                session, "base_identity_v1", []
-            )
+            base_identity = await StrictPromptLoader.load_and_validate(session, "base_identity_v1", [])
             base_methodology = await StrictPromptLoader.load_and_validate(
                 session, "base_methodology_v1", ["stage_desc"]
             )
             s0_rules = await StrictPromptLoader.load_and_validate(
-                session, "s0_intent_recognition_v1",
-                ["env_info", "alert_logs", "task_logs", "total_count", "categories_text"]
+                session,
+                "s0_intent_recognition_v1",
+                ["env_info", "alert_logs", "task_logs", "total_count", "categories_text"],
             )
-            base_context = await StrictPromptLoader.load_and_validate(
-                session, "base_case_context_v1", ["case_id"]
-            )
+            base_context = await StrictPromptLoader.load_and_validate(session, "base_case_context_v1", ["case_id"])
 
         formatted_methodology = base_methodology.format(stage_desc="S0 - 意图识别")
 
         total_count = sum(len(c) for c in categories.values()) if categories else 0
         categories_text = self._format_categories(categories)
 
+        if env_context and env_context.get("is_raw"):
+            env_info_val = json.dumps(env_context.get("env_info", {}), ensure_ascii=False, indent=2)
+            alert_logs_val = json.dumps(env_context.get("alert_logs", []), ensure_ascii=False, indent=2)
+            task_logs_val = json.dumps(env_context.get("task_logs", []), ensure_ascii=False, indent=2)
+        else:
+            env_info_val = env_context.get("env_info", "") if env_context else ""
+            alert_logs_val = env_context.get("alert_logs", "") if env_context else ""
+            task_logs_val = env_context.get("task_logs", "") if env_context else ""
+
         formatted_s0_rules = s0_rules.format(
-            env_info=env_context.get("env_info", "") if env_context else "",
-            alert_logs=env_context.get("alert_logs", "") if env_context else "",
-            task_logs=env_context.get("task_logs", "") if env_context else "",
+            env_info=env_info_val,
+            alert_logs=alert_logs_val,
+            task_logs=task_logs_val,
             total_count=total_count,
-            categories_text=categories_text
+            categories_text=categories_text,
         )
 
         formatted_context = base_context.format(case_id=case_id)
 
-        return "\n\n".join([
-            base_identity,
-            formatted_methodology,
-            formatted_s0_rules,
-            formatted_context
-        ])
-
+        return "\n\n".join([base_identity, formatted_methodology, formatted_s0_rules, formatted_context])
 
     # 叶子节点 code 格式正则：允许多级前缀（如 虚拟机-L2-001、硬件-003）
     # Unicode 转义避免 encoding 风险
