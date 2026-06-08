@@ -71,6 +71,9 @@ class AgentInteractiveRequest:
     options: list[dict[str, Any]] = field(default_factory=list)  # [{optionId, name}, ...]
     custom_input: bool = True  # 是否允许自定义文本输入
     metadata: dict[str, Any] = field(default_factory=dict)  # 额外元数据（route, risk 等）
+    exec_id: str | None = None  # 关联工具执行记录 ID
+    input_hash: str | None = None  # 关联工具调用参数哈希，防篡改
+    expires_at: str | None = None  # 授权决策过期时间 (ISO 8601 或 Unix 格式)
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,8 @@ class ToolResultEvent:
     result: Any  # 工具执行的原始结果
     tool_name: str = ""  # 工具名称（用于日志）
     error: str | None = None  # 错误信息（如有）
+    exec_id: str = ""  # 工具执行的唯一标识 ID
+
 
 
 # AgentEvent = 大脑可以产出的所有事件类型（用于 IDE 类型提示）
