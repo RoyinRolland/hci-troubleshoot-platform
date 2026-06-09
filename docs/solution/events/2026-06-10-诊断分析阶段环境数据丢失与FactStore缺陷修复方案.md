@@ -92,3 +92,19 @@ if not env_context and not has_stored_facts:
 
 ### 3.3 修复三：补全数据库 DDL 并应用迁移
 在 `database/desired_schema.sql` 中补全 `fact` 与 `claim_evidence_link` 的建表 DDL 及索引结构，并在开发环境运行 `atlas schema apply --env local --auto-approve` 以使 `FactStore` 在 PG 数据库层落地生效。
+
+---
+
+## 4. 2026-06-10 补充修复：命令执行超时与诊断阶段显示修复
+
+### 4.1 终端 Bridge `exec_id` 连字符不一致 Bug
+- **原因**：前端 `terminal.ts` 对 UUID `execID` 进行了剔除连字符（`-`）处理并截取前 16 位用于构建 SSH 执行完毕 marker。而 `terminal_bridge/main.go` 并没有做剔除连字符处理，导致切片前 16 位匹配 marker 失败。
+- **修复**：修改 `terminal_bridge/main.go` 中的 `checkMarkers` 和 `on_output_start`，将 `execID` 的连字符替换为空白后再提取前 16 位以和前端对齐。
+
+### 4.2 前端工单切换/刷新丢失诊断阶段 Bug
+- **原因**：在前端 `chat.ts` 中，切换工单或页面初始化时调用 `loadConversationHistory` 只加载了对话消息，没有将从数据库获取的最新诊断阶段 `conv.diagnostic_stage` 恢复给前端 `diagnosticStage.value` 响应式变量，导致前台界面重新加载时回退到默认的 `S0`。
+- **修复**：修改 `loadConversationHistory` 方法，在获取会话详情后，将 `conv.diagnostic_stage` 同步还原给 `diagnosticStage.value`。
+
+### 4.3 意图质量校验空列表拦截 Bug
+- **原因**：在 `evidence_builder.py` 的 `check_information_quality` 中，检查必填字段时，逻辑为 `if not val or val in ("", "N/A", "暂无数据", [], {}):`。当某些没有对应活跃任务或告警的工单数据被注入时，其 `task_logs` 或 `alert_logs` 表现为合法的空列表 `[]`。原逻辑会将 `[]` 误判为缺失字段，导致触发澄清拦截，提示“以下环境信息缺失：任务日志”。
+- **修复**：修改必填校验，仅当 `val` 为 `None`，或属于特定占位符字符串时视为缺失；空列表 `[]` 不再被视为缺失状态。
