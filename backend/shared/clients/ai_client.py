@@ -60,6 +60,27 @@ class AIAssistantClient(Protocol):
         ...
 
 
+def _is_retriable_invoke_error(exc: Exception) -> bool:
+    """判定非流式 invoke 调用的瞬态错误（可重试）。"""
+    import httpx
+
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return True
+    if isinstance(exc, httpx.ConnectError):
+        return True
+    message = str(exc).lower()
+    retriable_signatures = (
+        "incomplete chunked read",
+        "peer closed connection",
+        "read timeout",
+        "connection reset",
+        "server disconnected",
+    )
+    return any(sig in message for sig in retriable_signatures)
+
+
 class OpenClawAssistant:
     """
     OpenClaw AI助手客户端 (OpenAI兼容)
@@ -73,6 +94,10 @@ class OpenClawAssistant:
         provider_api_key: str | None = None,
         default_model: str = "glm-5",
         assistant_type: str = "htp-agent",
+        temperature: float = 0.1,
+        top_p: float = 0.3,
+        logprobs: bool = False,
+        top_logprobs: int = 0,
     ):
         self.base_url = base_url.rstrip("/")
         # api_key: LLM API 鉴权密钥
@@ -83,6 +108,11 @@ class OpenClawAssistant:
         self.assistant_type = assistant_type
         self.gateway_token = api_key
         self.prompt_audit_callback = None
+        # LLM 推理参数（SOP + ReAct 场景推荐低温度以保证工具调用确定性）
+        self.temperature = temperature
+        self.top_p = top_p
+        self.logprobs = logprobs
+        self.top_logprobs = top_logprobs
         # 流式 LLM 响应可能较慢，读超时通过环境变量 AI_CLIENT_READ_TIMEOUT_SEC 调整（默认 120s）
         _read_timeout = float(os.environ.get("AI_CLIENT_READ_TIMEOUT_SEC", "120.0"))
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(connect=10.0, read=_read_timeout, write=10.0, pool=10.0))
@@ -115,6 +145,9 @@ class OpenClawAssistant:
         pod_endpoint: str | None = None,
         model: str = "",
         case_id: str = "",
+        tools: list[dict] | None = None,
+        temperature: float | None = None,
+        top_p: float | None = None,
     ) -> AsyncGenerator[str, None]:
         """
         调用OpenClaw Chat Completions API (流式)
@@ -123,6 +156,9 @@ class OpenClawAssistant:
             messages: 消息列表 [{"role": "user", "content": "..."}]
             user_id: 用户ID (映射为OpenClaw Session Key)
             model: 模型名称
+            tools: 工具定义列表（OpenAI function calling 格式），非空时启用工具调用
+            temperature: 覆盖实例默认温度（None 则使用 self.temperature）
+            top_p: 覆盖实例默认 top_p（None 则使用 self.top_p）
 
         Yields:
             str: AI响应内容片段
@@ -131,18 +167,38 @@ class OpenClawAssistant:
             "Content-Type": "application/json",
         }
 
-        payload = {"model": model or self.default_model, "messages": messages, "stream": True, "user": user_id}
+        payload: dict[str, Any] = {
+            "model": model or self.default_model,
+            "messages": messages,
+            "stream": True,
+            "user": user_id,
+            "temperature": temperature if temperature is not None else self.temperature,
+            "top_p": top_p if top_p is not None else self.top_p,
+        }
+        if self.logprobs:
+            payload["logprobs"] = True
+            if self.top_logprobs > 0:
+                payload["top_logprobs"] = self.top_logprobs
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
 
         if getattr(self, "prompt_audit_callback", None):
             import asyncio
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self.prompt_audit_callback(
                     conversation_id=user_id,
                     assistant_type=self.assistant_type,
                     messages=messages,
                     case_id=case_id,
                 )
+            )
+            task.add_done_callback(
+                lambda t: logger.warning(
+                    event="prompt_audit_callback_failed",
+                    error=str(t.exception()),
+                ) if t.exception() else None
             )
 
         # Langfuse: 创建流式 generation（在首次请求前，覆盖所有 endpoint 重试）
@@ -154,6 +210,8 @@ class OpenClawAssistant:
             messages=messages,
         )
         full_text = ""  # 累积完整输出，流结束后写入 Langfuse
+        stream_usage: dict[str, int] = {}  # SSE 流末端的 usage 信息
+        stream_tool_calls: dict[int, dict] = {}  # 流式 tool_calls delta 累积（按 index 分组）
 
         # 先尝试 scheduler 分配的实例端点，若在首 token 前发生可恢复断流，再回退到稳定 base_url 重试一次。
         endpoints_to_try: list[str] = []
@@ -236,8 +294,17 @@ class OpenClawAssistant:
                                 # 空响应：跳出 SSE 循环，让代码进入流结束检查
                                 # （流结束检查会尝试 fallback endpoint 或抛出错误）
                                 break
-                            # 正常结束，有内容 → 写入 Langfuse
-                            end_generation(langfuse_gen, output=full_text, start_time=lf_start)
+                            # 正常结束，有内容 → 写入 Langfuse（含 SSE stream usage + tool_calls）
+                            tc_list = OpenClawAssistant._normalize_stream_tool_calls(stream_tool_calls)
+                            end_generation(
+                                langfuse_gen,
+                                output=full_text,
+                                tool_calls=tc_list if tc_list else None,
+                                prompt_tokens=stream_usage.get("prompt_tokens", 0),
+                                completion_tokens=stream_usage.get("completion_tokens", 0),
+                                total_tokens=stream_usage.get("total_tokens", 0),
+                                start_time=lf_start,
+                            )
                             return
 
                         try:
@@ -256,6 +323,31 @@ class OpenClawAssistant:
                                 # 思维链 token：标记已收到首个 token（防止空流误判），
                                 # 但不 yield 给调用方（调用方只需要最终回答内容）
                                 got_first_token = True
+                            # 流式 tool_calls delta 累积：OpenAI 兼容 API 在 streaming 模式下
+                            # 可能返回 function calling delta，需要按 index 分组拼接。
+                            tc_deltas = delta.get("tool_calls") or []
+                            for tc_delta in tc_deltas:
+                                idx = tc_delta.get("index", 0)
+                                if idx not in stream_tool_calls:
+                                    stream_tool_calls[idx] = {
+                                        "id": tc_delta.get("id", ""),
+                                        "name": "",
+                                        "arguments": "",
+                                    }
+                                entry = stream_tool_calls[idx]
+                                fn = tc_delta.get("function", {})
+                                if fn.get("name"):
+                                    entry["name"] = fn["name"]
+                                if fn.get("arguments"):
+                                    entry["arguments"] += fn["arguments"]
+                            # 提取 SSE 流末端的 usage 信息（OpenAI 兼容 API 在最后一个 data chunk 中返回）
+                            chunk_usage = data.get("usage")
+                            if chunk_usage and isinstance(chunk_usage, dict):
+                                stream_usage = {
+                                    "prompt_tokens": chunk_usage.get("prompt_tokens", 0),
+                                    "completion_tokens": chunk_usage.get("completion_tokens", 0),
+                                    "total_tokens": chunk_usage.get("total_tokens", 0),
+                                }
                         except json.JSONDecodeError:
                             continue
 
@@ -277,8 +369,17 @@ class OpenClawAssistant:
                             detail="status=200, stream ended without content",
                         )
 
-                # 成功获取内容 → 写入 Langfuse
-                end_generation(langfuse_gen, output=full_text, start_time=lf_start)
+                # 成功获取内容 → 写入 Langfuse（含 SSE stream usage + tool_calls）
+                tc_list = OpenClawAssistant._normalize_stream_tool_calls(stream_tool_calls)
+                end_generation(
+                    langfuse_gen,
+                    output=full_text,
+                    tool_calls=tc_list if tc_list else None,
+                    prompt_tokens=stream_usage.get("prompt_tokens", 0),
+                    completion_tokens=stream_usage.get("completion_tokens", 0),
+                    total_tokens=stream_usage.get("total_tokens", 0),
+                    start_time=lf_start,
+                )
                 return  # 成功获取内容，退出 endpoint 循环
             except AIStreamError:
                 # AIStreamError 直接透传，不包装
@@ -435,6 +536,22 @@ class OpenClawAssistant:
         }
 
     @staticmethod
+    def _normalize_stream_tool_calls(raw: dict[int, dict]) -> list[dict] | None:
+        """将流式累积的 tool_calls delta 归一化为 end_generation 可用的格式。"""
+        if not raw:
+            return None
+        result = []
+        for idx in sorted(raw.keys()):
+            entry = raw[idx]
+            if entry.get("name"):
+                try:
+                    args = json.loads(entry["arguments"]) if entry["arguments"] else {}
+                except json.JSONDecodeError:
+                    args = {"_raw": entry["arguments"]}
+                result.append({"name": entry["name"], "arguments": args})
+        return result or None
+
+    @staticmethod
     def _is_retriable_stream_error(exc: Exception) -> bool:
         """判定是否属于可通过切换端点重试的流式瞬态错误。"""
         message = str(exc).lower()
@@ -446,6 +563,7 @@ class OpenClawAssistant:
             "connection reset",
         )
         return any(sig in message for sig in retriable_signatures)
+
 
     async def check_health(self) -> bool:
         """检查OpenClaw服务健康状态"""
@@ -476,6 +594,8 @@ class OpenClawAssistant:
         model: str = "",
         response_format: dict | None = None,
         case_id: str = "",
+        temperature: float | None = None,
+        top_p: float | None = None,
     ) -> InvokeResult:
         """非流式 LLM 调用，支持工具调用（function calling）和结构化 JSON 输出。
 
@@ -490,6 +610,8 @@ class OpenClawAssistant:
             model: 模型名称（留空使用默认）
             response_format: 如 {"type": "json_object"} 强制 JSON 输出
             case_id: 工单 ID
+            temperature: 覆盖实例默认温度（None 则使用 self.temperature）
+            top_p: 覆盖实例默认 top_p（None 则使用 self.top_p）
 
         Returns:
             InvokeResult:
@@ -508,18 +630,30 @@ class OpenClawAssistant:
             "messages": messages,
             "stream": False,
             "user": user_id,
+            "temperature": temperature if temperature is not None else self.temperature,
+            "top_p": top_p if top_p is not None else self.top_p,
         }
+        if self.logprobs:
+            payload["logprobs"] = True
+            if self.top_logprobs > 0:
+                payload["top_logprobs"] = self.top_logprobs
 
         if getattr(self, "prompt_audit_callback", None):
             import asyncio
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self.prompt_audit_callback(
                     conversation_id=user_id,
                     assistant_type=self.assistant_type,
                     messages=messages,
                     case_id=case_id,
                 )
+            )
+            task.add_done_callback(
+                lambda t: logger.warning(
+                    event="prompt_audit_callback_failed",
+                    error=str(t.exception()),
+                ) if t.exception() else None
             )
         if tools:
             payload["tools"] = tools
@@ -541,88 +675,117 @@ class OpenClawAssistant:
             tool_count=len(tools) if tools else 0,
         )
 
-        try:
-            langfuse_gen, _, lf_start = await observe_invoke(
-                model=model or self.default_model,
-                assistant_type=self.assistant_type,
-                user_id=user_id,
-                case_id=case_id,
-                messages=messages,
-                tools=tools,
-            )
+        # Langfuse: 创建 observation（重试循环外，避免重复创建）
+        langfuse_gen, _, lf_start = await observe_invoke(
+            model=model or self.default_model,
+            assistant_type=self.assistant_type,
+            user_id=user_id,
+            case_id=case_id,
+            messages=messages,
+            tools=tools,
+        )
 
-            response = await self.client.post(url, json=payload, headers=headers)
-            if response.status_code != 200:
-                error_detail = self._parse_ai_error(response.status_code, response.text)
+        import asyncio as _asyncio
+
+        max_retries = 2
+
+        for attempt in range(max_retries + 1):
+            try:
+                response = await self.client.post(url, json=payload, headers=headers)
+                if response.status_code != 200:
+                    error_detail = self._parse_ai_error(response.status_code, response.text)
+                    # 5xx 服务器错误 → 可重试
+                    if response.status_code >= 500 and attempt < max_retries:
+                        logger.warning(
+                            event="ai_invoke_retry",
+                            message=f"HTTP {response.status_code} 可重试，第 {attempt + 1} 次",
+                            attempt=attempt + 1,
+                        )
+                        await _asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+                    end_generation(
+                        langfuse_gen,
+                        error=error_detail.get("message", f"HTTP {response.status_code}"),
+                        start_time=lf_start,
+                    )
+                    raise AIStreamError(
+                        code=error_detail["code"],
+                        message=error_detail["message"],
+                        detail=error_detail["detail"],
+                    )
+
+                data = response.json()
+                choice = data.get("choices", [{}])[0]
+                message = choice.get("message", {})
+
+                usage = data.get("usage") or {}
+                prompt_tokens = usage.get("prompt_tokens") or 0
+                completion_tokens = usage.get("completion_tokens") or 0
+                total_tokens = usage.get("total_tokens") or 0
+
+                # 工具调用分支
+                raw_tool_calls: list[dict] = message.get("tool_calls") or []
+                if raw_tool_calls:
+                    parsed: list[ToolCallRequest] = []
+                    for tc in raw_tool_calls:
+                        fn = tc.get("function", {})
+                        try:
+                            args = json.loads(fn.get("arguments", "{}"))
+                        except json.JSONDecodeError:
+                            args = {}
+                        parsed.append(
+                            ToolCallRequest(
+                                id=tc.get("id", ""),
+                                name=fn.get("name", ""),
+                                arguments=args,
+                            )
+                        )
+                    end_generation(
+                        langfuse_gen,
+                        tool_calls=[{"name": t.name, "arguments": t.arguments} for t in parsed],
+                        prompt_tokens=prompt_tokens,
+                        completion_tokens=completion_tokens,
+                        total_tokens=total_tokens,
+                        start_time=lf_start,
+                    )
+                    return InvokeResult(content=None, tool_calls=parsed)
+
+                # 文字终止分支
+                content = message.get("content") or ""
                 end_generation(
                     langfuse_gen,
-                    error=error_detail.get("message", f"HTTP {response.status_code}"),
+                    output=content,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    total_tokens=total_tokens,
+                    start_time=lf_start,
+                )
+                return InvokeResult(content=content, tool_calls=[])
+
+            except AIStreamError:
+                raise
+            except Exception as e:
+                retriable = _is_retriable_invoke_error(e)
+                if retriable and attempt < max_retries:
+                    logger.warning(
+                        event="ai_invoke_retry",
+                        message=f"瞬态错误可重试，第 {attempt + 1} 次",
+                        error=str(e)[:100],
+                        attempt=attempt + 1,
+                    )
+                    await _asyncio.sleep(1.0 * (attempt + 1))
+                    continue
+                error_detail = self._parse_generic_error(e)
+                end_generation(
+                    langfuse_gen,
+                    error=error_detail.get("message", str(e)),
                     start_time=lf_start,
                 )
                 raise AIStreamError(
                     code=error_detail["code"],
                     message=error_detail["message"],
                     detail=error_detail["detail"],
-                )
-
-            data = response.json()
-            choice = data.get("choices", [{}])[0]
-            message = choice.get("message", {})
-
-            # 提取 token 用量
-            usage = data.get("usage") or {}
-            prompt_tokens = usage.get("prompt_tokens") or 0
-            completion_tokens = usage.get("completion_tokens") or 0
-            total_tokens = usage.get("total_tokens") or 0
-
-            # 工具调用分支（finish_reason="tool_calls"）
-            raw_tool_calls: list[dict] = message.get("tool_calls") or []
-            if raw_tool_calls:
-                parsed: list[ToolCallRequest] = []
-                for tc in raw_tool_calls:
-                    fn = tc.get("function", {})
-                    try:
-                        args = json.loads(fn.get("arguments", "{}"))
-                    except json.JSONDecodeError:
-                        args = {}
-                    parsed.append(
-                        ToolCallRequest(
-                            id=tc.get("id", ""),
-                            name=fn.get("name", ""),
-                            arguments=args,
-                        )
-                    )
-                end_generation(
-                    langfuse_gen,
-                    tool_calls=[{"name": t.name, "arguments": t.arguments} for t in parsed],
-                    prompt_tokens=prompt_tokens,
-                    completion_tokens=completion_tokens,
-                    total_tokens=total_tokens,
-                    start_time=lf_start,
-                )
-                return InvokeResult(content=None, tool_calls=parsed)
-
-            # 文字终止分支（finish_reason="stop"）
-            content = message.get("content") or ""
-            end_generation(
-                langfuse_gen,
-                output=content,
-                prompt_tokens=prompt_tokens,
-                completion_tokens=completion_tokens,
-                total_tokens=total_tokens,
-                start_time=lf_start,
-            )
-            return InvokeResult(content=content, tool_calls=[])
-
-        except AIStreamError:
-            raise
-        except Exception as e:
-            error_detail = self._parse_generic_error(e)
-            raise AIStreamError(
-                code=error_detail["code"],
-                message=error_detail["message"],
-                detail=error_detail["detail"],
-            ) from e
+                ) from e
 
     async def close(self):
         """关闭客户端"""
@@ -698,6 +861,10 @@ def create_openclaw_client(
     provider_api_key: str | None = None,
     default_model: str = "openclaw",
     assistant_type: str = "htp-agent",
+    temperature: float = 0.1,
+    top_p: float = 0.3,
+    logprobs: bool = False,
+    top_logprobs: int = 0,
 ) -> OpenClawAssistant:
     """工厂函数: 创建OpenClaw助手客户端"""
     return OpenClawAssistant(
@@ -706,4 +873,8 @@ def create_openclaw_client(
         provider_api_key=provider_api_key,
         default_model=default_model,
         assistant_type=assistant_type,
+        temperature=temperature,
+        top_p=top_p,
+        logprobs=logprobs,
+        top_logprobs=top_logprobs,
     )

@@ -17,6 +17,7 @@ import json
 import re
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Protocol, runtime_checkable
@@ -24,9 +25,10 @@ from typing import Any, Protocol, runtime_checkable
 from opentelemetry import trace
 from pydantic import BaseModel
 from shared.clients import AIAssistantRegistry
-from shared.observability.langfuse import observe_tool
+from shared.observability.langfuse import observe_tool, start_agent_observation
 from shared.observability.logger import get_logger
 
+from app.config import settings
 from app.domain.agent_port import (
     AgentEvent,
     AgentInteractiveRequest,
@@ -316,6 +318,53 @@ class AuditServiceProtocol(Protocol):
     async def write(self, audit_id: str, **kwargs) -> None: ...
 
 
+def _sanitize_tool_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """清理不完整的 tool_calls/tool 消息对。
+
+    OpenAI API 要求每个 assistant 消息中的 tool_calls 必须有对应的 tool 消息。
+    前一轮中断（如用户取消、网络错误）可能导致对话历史中残留不配对的消息。
+    """
+    if not messages:
+        return messages
+
+    clean: list[dict[str, Any]] = []
+    pending_tool_call_ids: set[str] = set()
+
+    for msg in messages:
+        role = msg.get("role", "")
+
+        if role == "assistant" and msg.get("tool_calls"):
+            # 收集当前 assistant 消息中所有 tool_call_id
+            pending_tool_call_ids = {
+                tc.get("id", "") for tc in msg.get("tool_calls", []) if tc.get("id")
+            }
+            clean.append(msg)
+
+        elif role == "tool":
+            tc_id = msg.get("tool_call_id", "")
+            if tc_id in pending_tool_call_ids:
+                pending_tool_call_ids.discard(tc_id)
+                clean.append(msg)
+            # 如果 tool_call_id 不在待处理集合中（孤立 tool 消息），跳过
+
+        else:
+            # user/system 消息：如果有未配对的 tool_calls，移除最后一条 assistant 消息
+            if pending_tool_call_ids:
+                # 回退：移除未完整配对的 assistant tool_calls 消息
+                while clean and clean[-1].get("role") == "assistant" and clean[-1].get("tool_calls"):
+                    removed = clean.pop()
+                    removed_ids = {tc.get("id", "") for tc in removed.get("tool_calls", []) if tc.get("id")}
+                    pending_tool_call_ids -= removed_ids
+                pending_tool_call_ids.clear()
+            clean.append(msg)
+
+    # 末尾残留：最后一条是带 tool_calls 的 assistant 但无后续 tool 消息
+    if pending_tool_call_ids and clean and clean[-1].get("role") == "assistant" and clean[-1].get("tool_calls"):
+        clean.pop()
+
+    return clean
+
+
 class ReactEngine:
     """ReAct 循环执行引擎"""
 
@@ -389,23 +438,57 @@ class ReactEngine:
             yield AgentTextChunk(content="[错误] 未找到 AI 客户端")
             return
 
-        # T3-3: 输出可审计推理摘要。生产环境不要求暴露完整隐藏思维链，只展示证据化摘要。
+        # Langfuse: 创建顶层 agent execution span，串联后续所有 LLM 调用与工具执行
+        agent_obs, agent_obs_ctx = start_agent_observation(
+            user_id=user_id,
+            case_id=case_id,
+            assistant_type=assistant_type,
+            execution_mode=execution_mode,
+            sop_mode=sop_mode,
+            max_iterations=max_iterations,
+        )
+        total_steps = 0
+
+        def _end_agent_obs():
+            """结束 Langfuse agent execution observation。在 execute() 所有退出路径上调用。"""
+            if agent_obs:
+                with suppress(Exception):
+                    agent_obs.update(metadata={"total_steps": total_steps})
+            if agent_obs_ctx:
+                agent_obs_ctx.__exit__(None, None, None)
+
+        # T3-3/DC-05/DC-06: 统一输出约束（精简合并，减少 token 浪费）
+        # T3-3/DC-05/DC-06/DC-08: 统一输出约束
         system_prompt += (
-            "\n\n【可展示推理摘要强制要求】\n"
-            "在你输出最终回答或调用工具之前，你必须使用 `<reasoning>` 标签包裹一段可展示的推理摘要。"
-            "该摘要只列出证据、假设、置信度和下一步行动，不要暴露冗长的隐藏思维链或无证据猜测。摘要必须包含：\n"
-            "1. 已收集证据（引用实际工具输出或已知事实）；\n"
-            "2. 假设支撑与反对情况；\n"
-            "3. 置信度评估（高/中/低，并说明证据是否充分）；\n"
-            "4. 下一步行动说明（继续采集、验证或给出结论）。\n"
-            "例如：\n"
-            "<reasoning>\n"
-            "1. 已收集证据：已执行 get_active_alerts，返回存在存储相关告警；尚未执行磁盘 SMART 检查。\n"
-            "2. 假设支撑/反对：存储告警支持磁盘或链路异常；缺少 SMART/链路计数器作为直接证据。\n"
-            "3. 置信度评估：中，当前证据只能支持疑似判断。\n"
-            "4. 下一步行动：调用只读诊断工具补充磁盘与链路状态。\n"
-            "</reasoning>\n"
-            "请确保 `<reasoning>` 标签放在你输出的最开头。"
+            "\n\n【输出约束 — 强制执行】\n"
+            "1. 每次回复前用 <reasoning> 简述：已收集证据 / 假设支撑与反对 / 置信度(高/中/低) / 下一步行动。\n"
+            "2. 最终诊断报告严格按此模板，章节标题不得改名或增减：\n"
+            "   ## 故障摘要\n"
+            "   （一段话概述：什么故障、什么主机/磁盘/虚拟机、关键证据数据、根本原因）\n"
+            "   ## 根因\n"
+            "   （明确的根因判定，引用工具输出中的具体数据）\n"
+            "   ## 修复方案\n"
+            "   （solution 节点原文直出，合并快速恢复和彻底恢复为一段，不可修改、不可增删步骤）\n"
+            "3. solution 节点（no_tool_execution=true）：只输出其 content 原文，**严禁调用任何工具**。\n"
+            "4. 报告输出完毕后立即终止，不得追加额外步骤或工具调用。\n"
+            "5. 【数据源铁律】诊断报告的每一项内容必须来自以下三类来源之一，禁止使用训练数据中的通用知识：\n"
+            "   a. SOP 节点的 content/solution 原文（只能引用，不能改写）\n"
+            "   b. 工具执行的实际输出（bash_exec stdout / acli_exec json，必须标注具体命令）\n"
+            "   c. SOP 变量值（通过 sop_request_variable 或 skill 获取的 {variable} 值）\n"
+            "   严禁：编造具体数值（虚拟机名、时延ms、容量TB）、添加 SOP 中没有的修复步骤、\n"
+            "   使用「通常」「一般」「建议」「可能」开头且无工具输出支撑的句子。\n"
+            "6. 【SOP决策树强制遵循】诊断必须严格按决策树节点推进，禁止自由探索：\n"
+            "   a. 到达 branch 节点后先执行该节点的 commands，再根据结果选择子节点\n"
+            "   b. 选择子节点必须通过 sop_advance 推进，严禁自行判断分支\n"
+            "   c. 叶节点(diagnosis/solution)到达后直接输出其 content\n"
+            "   d. **严禁绕过 SOP 自行调用 acli_exec/bash_exec 探索**，所有工具调用必须来自当前 SOP 节点的 commands\n"
+            "   e. sop_request_variable 获取 skill 变量后必须根据结果走对应 solution，不继续探索子节点\n"
+            "   f. sop_request_variable 只能请求 SOP 节点 required_variables 中列出的变量名，**严禁自行编造变量名**\n"
+            "      （如 alert_parsed、disk_info 等）。若返回 suggested_variables，必须用建议的变量名重试。\n"
+            "7. 【分支选择原则】到达 branch 节点后：\n"
+            "   a. 若节点有 has_solution=true：先获取依赖变量（如 check_meth），根据 skill 输出判断是否需要深入子节点\n"
+            "   b. 若节点 commands 为空且 children 非空：直接读取子节点内容，对比 evidence 选择最匹配的分支\n"
+            "   c. 选择分支**只看子节点的 prerequisites 是否满足当前收集的证据**，不凭「经验」或「通用知识」判断"
         )
 
         if response_schema:
@@ -418,24 +501,13 @@ class ReactEngine:
             )
 
         # 工作消息列表（在循环中动态追加）
+        # 清理对话历史中不完整的 tool_calls/tool 配对，OpenAI API 要求每个
+        # tool_call_id 必须有对应的 tool 消息，否则返回 400 错误
+        clean_messages = _sanitize_tool_messages(messages)
         work_messages: list[dict] = [
             {"role": "system", "content": system_prompt},
-            *messages,
+            *clean_messages,
         ]
-
-        def extract_json(text: str) -> str:
-            text_clean = re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL | re.IGNORECASE)
-            match = re.search(r"```json\s*(.*?)\s*```", text_clean, re.DOTALL | re.IGNORECASE)
-            if match:
-                return match.group(1).strip()
-            match = re.search(r"```\s*(.*?)\s*```", text_clean, re.DOTALL)
-            if match:
-                return match.group(1).strip()
-            start = text_clean.find("{")
-            end = text_clean.rfind("}")
-            if start != -1 and end != -1 and end > start:
-                return text_clean[start : end + 1].strip()
-            return text_clean.strip()
 
         # 工具列表（OpenAI function calling 格式）+ 动态注入工具（T-AGT-22）
         tools = await self._get_tools_for_llm(extra_tools=extra_tools, sop_mode=sop_mode)
@@ -457,6 +529,7 @@ class ReactEngine:
                     tools=tools,
                     user_id=session_id,
                     case_id=case_id,
+                    temperature=settings.LLM_TEMPERATURE_REACT,
                 )
             except Exception as exc:
                 logger.error(
@@ -465,7 +538,9 @@ class ReactEngine:
                     step=step_count,
                     session_id=session_id,
                 )
+                total_steps = step_count
                 yield AgentTextChunk(content=f"[错误] LLM 调用失败：{exc}")
+                _end_agent_obs()
                 return
 
             # ── 终止条件：LLM 给出文字回复 ─────────────────────────────────
@@ -527,32 +602,49 @@ class ReactEngine:
                 )
 
                 if detection_report.get("has_hallucination"):
-                    logger.warning(
-                        "hallucination_detected_before_report", "最终报告生成前检测到幻觉，尝试重新生成一次 (Re-run)..."
+                    # 若 LLM 输出已包含明确的诊断结论标记，说明推理已完成，
+                    # 幻觉检测的假阳性（如引用了来自 SOP 上下文而非工具执行的数据源）
+                    # 不应触发 re-run。re-run 会增加 5-15s 延迟且常产出更差的输出。
+                    conclusion_markers = [
+                        "排障结论", "根因已确认", "根因确认", "排障闭环",
+                        "修复方案", "诊断结论", "根因定位",
+                    ]
+                    has_conclusion = any(
+                        m in (invoke_result.content or "") for m in conclusion_markers
                     )
-                    try:
-                        temp_messages = work_messages + [
-                            {"role": "assistant", "content": invoke_result.content},
-                            {
-                                "role": "system",
-                                "content": "【反幻觉自我检查指令】你的上一次回答中包含未实际执行的工具引用，或者未在工具输出中找到数据来源的数值/百分比。请进行一步自我检查，修正这些幻觉，仅引用实际执行过的工具及对应的结果。请重新输出你的回答。",
-                            },
-                        ]
-                        new_invoke_result = await ai_client.invoke(
-                            messages=temp_messages,
-                            tools=tools,
-                            user_id=session_id,
-                            case_id=case_id,
+                    if has_conclusion:
+                        logger.info(
+                            "hallucination_rerun_skipped",
+                            "检测到幻觉但输出已包含结论，跳过 re-run，由二次检测追加警告",
                         )
-                        if new_invoke_result.content is not None:
-                            logger.info("rerun_success", "Re-run 重新生成成功")
-                            invoke_result = new_invoke_result
-                    except Exception as re_exc:
-                        logger.warning("rerun_failed", f"Re-run 失败: {re_exc}")
+                    else:
+                        logger.warning(
+                            "hallucination_detected_before_report", "最终报告生成前检测到幻觉，尝试重新生成一次 (Re-run)..."
+                        )
+                        try:
+                            temp_messages = work_messages + [
+                                {"role": "assistant", "content": invoke_result.content},
+                                {
+                                    "role": "system",
+                                    "content": "【反幻觉自我检查指令】你的上一次回答中包含未实际执行的工具引用，或者未在工具输出中找到数据来源的数值/百分比。请进行一步自我检查，修正这些幻觉，仅引用实际执行过的工具及对应的结果。请重新输出你的回答。",
+                                },
+                            ]
+                            new_invoke_result = await ai_client.invoke(
+                                messages=temp_messages,
+                                tools=tools,
+                                user_id=session_id,
+                                case_id=case_id,
+                                temperature=settings.LLM_TEMPERATURE_REACT,
+                            )
+                            if new_invoke_result.content is not None:
+                                logger.info("rerun_success", "Re-run 重新生成成功")
+                                invoke_result = new_invoke_result
+                        except Exception as re_exc:
+                            logger.warning("rerun_failed", f"Re-run 失败: {re_exc}")
 
                 # T3-2: 校验 Schema
                 if response_schema:
-                    cleaned_json = extract_json(invoke_result.content)
+                    cleaned_json = self._extract_json(invoke_result.content)
                     try:
                         parsed = response_schema.model_validate_json(cleaned_json)
                         logger.info(
@@ -599,81 +691,21 @@ class ReactEngine:
                         except Exception as met_err:
                             logger.warning("metrics_record_failed", f"记录 metrics 失败: {met_err}")
 
-                # 流式输出最终文字回复
-                full_stream_text = ""
-                async for chunk in ai_client.chat_completion_stream(
-                    messages=work_messages,
-                    user_id=session_id,
-                    case_id=case_id,
-                ):
-                    if chunk:
-                        full_stream_text += chunk
-                        yield AgentTextChunk(content=chunk)
+                # 流式输出最终文字回复（直接从 invoke_result.content 分块 yield，
+                # 不再重复调用 LLM 流式 API。invoke() 已经返回了完整的诊断结论文本，
+                # 无需为了分块显示再发起一次冗余的流式调用。这不仅浪费 tokens 和耗时，
+                # 还可能导致 LLM 在流式模式下输出 tool_call XML 而非文本，让用户看到无效内容。
+                # 工具不是目的，根因解决方案才是目的。）
+                final_content = invoke_result.content or ""
+                chunk_size = 80
+                for i in range(0, len(final_content), chunk_size):
+                    chunk = final_content[i : i + chunk_size]
+                    yield AgentTextChunk(content=chunk)
+                    await asyncio.sleep(0.01)  # 模拟流式打字体验
 
-                # 流式输出后校验 (如果是重新生成文本的话)
-                if response_schema and not self.schema_validation_failed:
-                    cleaned_json = extract_json(full_stream_text)
-                    try:
-                        parsed = response_schema.model_validate_json(cleaned_json)
-                        try:
-                            from app.services.metrics import AGENT_SCHEMA_VALIDATION_TOTAL
-
-                            AGENT_SCHEMA_VALIDATION_TOTAL.labels(
-                                schema_name=response_schema.__name__, status="success"
-                            ).inc()
-                        except Exception as met_err:
-                            logger.warning("metrics_record_failed", f"记录 metrics 失败: {met_err}")
-                        if response_schema.__name__ == "ClaimVerification" and self._fact_store:
-                            await self._fact_store.write_claim_verification(session_id, parsed)
-                        # T4-2: ReasoningOutput 置信度与无证据结论指标（流式路径）
-                        if response_schema.__name__ == "ReasoningOutput":
-                            try:
-                                from app.services.metrics import (
-                                    AGENT_REASONING_CONFIDENCE,
-                                    AGENT_UNSUPPORTED_CLAIM_TOTAL,
-                                )
-
-                                if hasattr(parsed, "hypotheses") and parsed.hypotheses:
-                                    avg_conf = sum(h.confidence for h in parsed.hypotheses) / len(parsed.hypotheses)
-                                    AGENT_REASONING_CONFIDENCE.set(avg_conf)
-                                if hasattr(parsed, "unsupported_claims") and parsed.unsupported_claims:
-                                    for _claim in parsed.unsupported_claims:
-                                        AGENT_UNSUPPORTED_CLAIM_TOTAL.labels(claim_type="reasoning_output").inc()
-                            except Exception as met_err:
-                                logger.warning(
-                                    "metrics_record_failed", f"记录 ReasoningOutput 流式 metrics 失败: {met_err}"
-                                )
-                    except Exception as e:
-                        logger.warning(
-                            "stream_schema_validation_failed", f"流式结构化输出校验失败: {e}, raw={full_stream_text}"
-                        )
-                        self.schema_validation_failed = True
-                        try:
-                            from app.services.metrics import AGENT_SCHEMA_VALIDATION_TOTAL
-
-                            AGENT_SCHEMA_VALIDATION_TOTAL.labels(
-                                schema_name=response_schema.__name__, status="failed"
-                            ).inc()
-                        except Exception as met_err:
-                            logger.warning("metrics_record_failed", f"记录 metrics 失败: {met_err}")
-
-                # T3-4: 运行轻量级幻觉检测器
-                from app.services.hallucination_detector import HallucinationDetector
-
-                detector = HallucinationDetector(tool_registry=self._tool_registry)
-
-                tool_results_list = []
-                executed_tool_names = []
-                for msg in work_messages:
-                    if msg.get("role") == "tool":
-                        tool_results_list.append(msg.get("content", ""))
-                    if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                        for tc in msg["tool_calls"]:
-                            fn = tc.get("function", {})
-                            if fn.get("name"):
-                                executed_tool_names.append(fn["name"])
-
-                final_text = full_stream_text or invoke_result.content or ""
+                # 流式输出后二次幻觉检测：若 re-run 前检测到幻觉并已触发重新生成，
+                # 此处对 re-run 后的内容再做一次检测，有残留幻觉时追加警告提示。
+                final_text = invoke_result.content or ""
                 detection_report = detector.detect(
                     llm_text=final_text, executed_tools=executed_tool_names, tool_outputs=tool_results_list
                 )
@@ -718,6 +750,8 @@ class ReactEngine:
                 except Exception as met_err:
                     logger.warning("metrics_record_failed", f"记录步数 metrics 失败: {met_err}")
 
+                total_steps = step_count
+                _end_agent_obs()
                 return
 
             # ── 工具调用轮次 ──────────────────────────────────────────────────
@@ -728,7 +762,9 @@ class ReactEngine:
                     step=step_count,
                     session_id=session_id,
                 )
+                total_steps = step_count
                 yield AgentTextChunk(content="诊断推理已完成。")
+                _end_agent_obs()
                 return
 
             # 将 assistant tool_calls 消息追加到历史
@@ -800,11 +836,14 @@ class ReactEngine:
                         tool_error = event.error
                         if event.exec_id:
                             tool_exec_id = event.exec_id
-                    # AgentTextChunk 需要传递给外层（如"操作已取消"、"确认服务暂不可用"）
+                    # AgentTextChunk 需要传递给外层（如"操作已取消"、"确认服务暂不可用"）。
+                    # 仅用户取消/服务不可用才终止循环；工具执行报错（如"命令执行失败"）
+                    # 不应终止，应让 LLM 拿到错误结果后自我修正继续推理。
                     elif isinstance(event, AgentTextChunk):
                         yield event
-                        # 工具执行被取消或失败时，终止循环
-                        if "取消" in event.content or "中止" in event.content or "失败" in event.content:
+                        if "操作已取消" in event.content or "已中止" in event.content:
+                            total_steps = step_count
+                            _end_agent_obs()
                             return
                     else:
                         yield event
@@ -839,7 +878,28 @@ class ReactEngine:
                     )
 
         # 超出步数限制
+        total_steps = max_iterations
         yield AgentTextChunk(content="⚠️ 诊断步骤已达上限，请联系人工支持。")
+
+        # Langfuse: 结束 agent execution span
+        _end_agent_obs()
+        return
+
+    @staticmethod
+    def _extract_json(text: str) -> str:
+        """从 LLM 输出中提取 JSON 片段（去除 <reasoning> 标签）。"""
+        text_clean = re.sub(r"<reasoning>.*?</reasoning>", "", text, flags=re.DOTALL | re.IGNORECASE)
+        match = re.search(r"```json\s*(.*?)\s*```", text_clean, re.DOTALL | re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+        match = re.search(r"```\s*(.*?)\s*```", text_clean, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        start = text_clean.find("{")
+        end = text_clean.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return text_clean[start : end + 1].strip()
+        return text_clean.strip()
 
     async def _get_tools_for_llm(self, extra_tools: list[dict] | None = None, sop_mode: bool = False) -> list[dict]:
         """返回 OpenAI function calling 格式 of 工具列表（排除高危工具）。
@@ -955,6 +1015,26 @@ class ReactEngine:
                 logger.error(f"写入 proposed 状态审计失败: {e}")
 
         tool_def = active_tool_registry.get(tool_name)
+        if tool_def:
+            # 运行时契约门禁：数据库 tool_definition 更新后若 usage_template 与 parameters 不一致，
+            # 在工具执行前拦截，避免重启后才暴露。仅检查被调用的工具，不影响其他工具。
+            try:
+                from app.adapters.agents.htp.tool_registry import verify_tool_contract
+                verify_tool_contract(tool_def)
+            except Exception as contract_err:
+                logger.error(
+                    event="tool_contract_runtime_failed",
+                    tool_name=tool_name,
+                    error=str(contract_err),
+                )
+                yield ToolResultEvent(
+                    tool_name=tool_name,
+                    exec_id=exec_id,
+                    result={"error": f"工具 {tool_name} 契约校验失败: {contract_err}"},
+                    error="contract_verification_failed",
+                )
+                return
+
         if not tool_def:
             # T0-1：未知工具路径统一走 ToolResultEnvelope，让 LLM 能拿到结构化错误并自我纠正
             envelope = ToolResultEnvelope(
@@ -1152,9 +1232,6 @@ class ReactEngine:
                     result=envelope,
                     exec_id=exec_id,
                     tool_name=tool_name,
-                    args=tool_args,
-                    risk_level=tool_def.risk_level,
-                    duration_ms=0,
                 )
                 return
         # ─────────────────────────────────────────
@@ -1257,7 +1334,7 @@ class ReactEngine:
                 suggested_next_action="请联系运维确认 Redis 与 ConfirmService 是否正常；或改用 risk_level<=1 的只读工具继续诊断",
             )
             # 在 _execute_tool_call 协程中只通过 yield ToolResultEvent 上抛工具结果，
-            # 由上游 _stream_with_tools 负责将其追加到 work_messages 并回填给 LLM。
+            # 由上游 execute() 主循环负责将其追加到 work_messages 并回填给 LLM。
             yield ToolResultEvent(
                 tool_name=tool_name,
                 exec_id=exec_id,

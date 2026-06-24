@@ -260,6 +260,7 @@ def _build_node_response(
                 "content": _format_solution_content(solution),
                 "commands": [],
                 "children": [],
+                "no_tool_execution": True,  # 修复方案仅供用户参考，Agent 严禁执行其中命令
                 "required_variables": required_vars,
                 "preferred_next_steps": preferred_next_steps,
             }
@@ -289,6 +290,11 @@ def _build_node_response(
             content_parts.append("【进入条件】")
             content_parts.extend(f"- {p}" for p in prerequisites)
 
+        # branch 节点也可能有 solution（完成本节点诊断后的判定/处理方案），
+        # 必须返回让 LLM 看到，避免 LLM 跳过 solution 直接探索子分支
+        solution = node.get("solution")
+        has_solution = bool(solution)
+
         response = {
             "node_id": node_id_val,
             "type": "branch",
@@ -297,9 +303,12 @@ def _build_node_response(
             "commands": commands,
             "tool_calls": normalize_sop_commands(commands, reason=f"执行 SOP 节点「{node_name_val}」的前置检查命令"),
             "children": children_summary,
+            "has_solution": has_solution,
             "required_variables": required_vars,
             "preferred_next_steps": preferred_next_steps,
         }
+        if has_solution:
+            response["solution"] = _format_solution_content(solution)
         return response
 
 
@@ -343,7 +352,9 @@ def _extract_node_variable_names(node: dict) -> set[str]:
             for value in solution.get(key, []) or []:
                 texts.append(str(value))
     joined = "\n".join(texts)
-    return {match.replace("\\", "") for match in re.findall(r"(?<!\{)\$?\{([a-z][a-z0-9_\\]*)\}(?!\})", joined)}
+    # 匹配 {var_name} 格式的 SOP 变量（小写开头），排除 ${ENV_VAR} 和 ${shell_var} 及大写环境变量
+    raw_matches = re.findall(r"(?<!\{)\{([a-z][a-z0-9_]*)\}(?!\})", joined)
+    return {m.replace("\\", "") for m in raw_matches}
 
 
 def _has_variable_value(context_variables: dict[str, Any], variable_name: str) -> bool:
@@ -452,17 +463,15 @@ def _format_diagnosis_content(diagnosis: dict) -> str:
 
 
 def _format_solution_content(solution: dict) -> str:
-    """格式化解决方案内容为可读文本。"""
+    """格式化解决方案内容为可读文本（合并快速恢复和彻底恢复）。"""
     parts = []
 
     quick_recovery = solution.get("quick_recovery", [])
-    if quick_recovery:
-        parts.append("【快速恢复】")
-        parts.extend(f"- {s}" for s in quick_recovery)
-
     thorough_fix = solution.get("thorough_fix", [])
+
+    if quick_recovery:
+        parts.extend(f"- {s}" for s in quick_recovery)
     if thorough_fix:
-        parts.append("【彻底解决】")
         parts.extend(f"- {s}" for s in thorough_fix)
 
     return "\n".join(parts)
