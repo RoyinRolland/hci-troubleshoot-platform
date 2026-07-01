@@ -10,17 +10,20 @@ global:
   # --------------------------------------------------------------------
   # "path"      路径路由（推荐，单 IP / 单域名场景）
   #             acli.sangfor.com.cn/         → customer-ui
-  #             acli.sangfor.com.cn/admin/   → admin-ui
   #             acli.sangfor.com.cn/api      → api-gateway
   #             acli.sangfor.com.cn/grafana  → grafana
   #             ✅ 只需一条 A 记录指向服务器 IP
+  #             ⚠️  admin-ui 已分离到独立 Ingress（内网隔离方案）
+  #                 详见: docs/deploy/admin-ui-internal-isolation.md
   #
   # "subdomain" 子域名路由（需要 DNS 通配符 *.your-domain.com）
   #             api.your-domain.com          → api-gateway
-  #             admin.your-domain.com        → admin-ui
+  #             admin.your-domain.com        → admin-ui（⚠️ 未隔离）
   #             your-domain.com              → customer-ui
   #             grafana.your-domain.com      → grafana
   #             ❌ 如果没有通配符 DNS 记录，此模式下子域名全部无法访问
+  #             ⚠️  subdomain 模式下 admin-ui 仍通过公网入口暴露
+  #                 内网隔离方案仅适用于 routingMode=path
   # --------------------------------------------------------------------
   routingMode: "path"
 
@@ -279,6 +282,23 @@ adminUI:
     limits:
       cpu: "100m"
       memory: "64Mi"
+  # Admin UI 独立 Ingress 配置（内网隔离方案）
+  # 使用 web entrypoint (端口 4888)，与 customer-ui (端口 4443) 端口隔离
+  # 配合云厂商安全组 IP 白名单，实现 admin-ui 仅对管理员可访问
+  ingress:
+    enabled: false
+    # entrypoint: web (HTTP 端口 4888，部署后需启用 TLS)
+    # 或使用自定义 entrypoint（需先在 Traefik 配置）
+    entrypoint: web
+    # host: 留空时无 host 匹配（端口隔离场景）
+    # 或配置内网域名如: admin.internal
+    host: ""
+    annotations: {}
+    # TLS 配置（可选）
+    # tls:
+    #   - secretName: admin-tls
+    #     hosts:
+    #       - admin.internal
 
 # ======================== NetworkPolicy =====================================
 networkPolicy:
