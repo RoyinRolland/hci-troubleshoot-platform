@@ -490,36 +490,36 @@ DESCRIPTION:
 ## 输出格式（严格 JSON，不要任何额外说明）
 
 ```json
-{{{
+{{
   "signals": [
-    {{{
+    {{
       "id": "s1",
       "signal_category": "frontend",
       "keyword": "备节点异常",
       "description": "检查配置存储服务备节点异常告警",
       "acquirer": "qkv.alert",
-      "acquirer_args": {{{"keyword": "备节点异常", "is_failed": false, "limit": 100}}},
-      "produces": [{{{"name": "HOST", "path": "host"}}}, {{{"name": "VM", "path": "vm"}}}],
+      "acquirer_args": {{"keyword": "备节点异常", "is_failed": false, "limit": 100}},
+      "produces": [{{"name": "HOST", "path": "host"}}, {{"name": "VM", "path": "vm"}}],
       "requires": [],
       "matcher": null,
       "source_section": "steps_text",
       "confidence": 0.9
-    }}},
-    {{{
+    }},
+    {{
       "id": "s2",
       "signal_category": "backend",
       "keyword": "CPU 资源不足",
       "description": "若日志含 CPU 资源不足则根因锁定",
       "acquirer": "qfk.log_keyword",
-      "acquirer_args": {{{"target": {{{"scope": "{{{{HOST}}}}"}}}}}},
+      "acquirer_args": {{"target": {{"scope": "{{{{HOST}}}}"}}}},
       "produces": [],
       "requires": ["HOST"],
-      "matcher": {{{"type": "keyword", "pattern": "CPU 资源不足", "mode": "any", "expected": true}}},
+      "matcher": {{"type": "keyword", "pattern": "CPU 资源不足", "mode": "any", "expected": true}},
       "source_section": "root_cause",
       "confidence": 0.85
-    }}}
+    }}
   ]
-}}}
+}}
 ```
 $TEMPLATE$,
     '1.0',
