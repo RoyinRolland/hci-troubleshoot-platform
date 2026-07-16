@@ -86,17 +86,17 @@ async def qfk_exec(
     """
     # 1. 寻找 handler 处理器并构建指令
     try:
-        handler = HandlerRegistry.get(signal.signal_type)
+        handler = HandlerRegistry.get(signal.namespace)
         commands = handler.build_commands(signal)
     except Exception as e:
         logger.warning(
             event="qfk_handler_setup_failed",
-            signal_type=signal.signal_type.value,
+            namespace=signal.namespace,
             error=str(e),
         )
         return QFKResult(
             matched=False,
-            signal_type=signal.signal_type.value,
+            signal_type=signal.namespace,
             commands=[],
             keywords=signal.keywords,
             match_mode=signal.match_mode,
@@ -107,7 +107,7 @@ async def qfk_exec(
 
     logger.info(
         event="qfk_engine_executing",
-        signal_type=signal.signal_type.value,
+        namespace=signal.namespace,
         commands=commands,
         keywords=signal.keywords,
         match_mode=signal.match_mode,
@@ -120,7 +120,7 @@ async def qfk_exec(
     if _executor is None:
         return QFKResult(
             matched=False,
-            signal_type=signal.signal_type.value,
+            signal_type=signal.namespace,
             commands=commands,
             keywords=signal.keywords,
             match_mode=signal.match_mode,
@@ -153,7 +153,7 @@ async def qfk_exec(
             )
             return QFKResult(
                 matched=False,
-                signal_type=signal.signal_type.value,
+                signal_type=signal.namespace,
                 commands=commands,
                 keywords=signal.keywords,
                 match_mode=signal.match_mode,
@@ -163,21 +163,27 @@ async def qfk_exec(
                 exec_ids=exec_ids,
             )
 
-    # 3. 解析结果并做关键字评估
-    matched, evidence = handler.evaluate(results, signal.keywords, signal.match_mode)
+    # 3. 解析结果并做关键字评估（evaluate 同时返回命中关键字，避免重复计算）
+    matched, matched_kws, evidence = handler.evaluate(results, signal.keywords, signal.match_mode)
 
-    # 提取实际命中的关键字，用于后续状态填充
-    combined_lower = "\n".join([f"{r.stdout}\n{r.stderr}" for r in results]).lower()
-    matched_kws = [kw for kw in signal.keywords if kw.lower() in combined_lower]
-
-    # 4. 根据 expected (预期结果) 做出最终布尔翻转
-    # 例如：如果排查项检查"无OOM报错"，expected=False (不期望匹配到关键字)
-    # 如果 matched=True (匹配到了报错词)，则最终判定 matched = False (判定异常/不符合正常预期)
-    final_matched = matched if signal.expected else not matched
+    # 4. 最终布尔判定
+    # match_mode == "not" 已在 evaluate 内部表达取反语义（均不出现才为真），无需再翻转；
+    # 其余模式（or/and）兼容旧 matcher 的 expected 翻转（expected=False 表示"不出现才符合预期"）。
+    mode_norm = {"any": "or", "all": "and"}.get(
+        (signal.match_mode or "or").lower(), (signal.match_mode or "or").lower()
+    )
+    # 显式 is True（详见 2.3①）：signal.expected 为 bool（默认 True，由 pydantic 在
+    # 边界拒绝 None/非布尔），此处仅信任布尔真值；避免 falsy 判断在「上游误传 None」时
+    # 静默走入 not matched 分支。mode == "not" 已在 evaluate 内部表达取反语义，无需再翻转。
+    final_matched = (
+        matched
+        if mode_norm == "not"
+        else matched if (signal.expected is True) else not matched
+    )
 
     logger.info(
         event="qfk_engine_finished",
-        signal_type=signal.signal_type.value,
+        namespace=signal.namespace,
         raw_matched=matched,
         final_matched=final_matched,
         matched_keywords=matched_kws,
@@ -185,7 +191,7 @@ async def qfk_exec(
 
     return QFKResult(
         matched=final_matched,
-        signal_type=signal.signal_type.value,
+        signal_type=signal.namespace,
         commands=commands,
         keywords=signal.keywords,
         match_mode=signal.match_mode,
