@@ -1,16 +1,19 @@
 -- ===========================================================================
--- Migration: 008_update_kbd_extract_signals_v2_prompt.sql
--- 说明: 修复 kbd_extract_signals_v2 Prompt 缺失「说明(description) 与 关键字 的边界」
---       约束（规则 11）+ qfk_storage 带 description 的正确示例 sig_004。
--- 背景: 原修复 PR #605 将本 SQL 放到了 database/atlas-migrations/ 目录，但部署链路
---       （scripts/migration-runner.sh + helm db-migrate hook）只执行 data-migrations/，
---       而 atlas-migrations/ 不会被任何流程跑，故修复从未落地——库内的 v2 Prompt 仍是
---       初版，完全没有要求输出 description，导致 QFK 系统检测类信号（如 lsof 检查镜像
---       占用、ps 确认第三方进程）要么把说明错填进 resource_keyword/keyword，要么干脆
---       不输出说明。现把修复迁移到正确的 data-migrations 通道。
--- 幂等: 仅对 name=kbd_extract_signals_v2 的行生效，无条件覆盖 content_template，
---       重复执行无副作用（migration_history 也保证只跑一次）。
--- 参考: PR #605/#607 复盘
+-- Migration: 009_fix_kbd_extract_signals_v2_sig004_qfk_system.sql
+-- 说明: 修复 008 迁移引入的回归——其 sig_004 正例工具错配为 qfk_storage
+--       （真实 KBD 应为 qfk_system 的 ps/lsof 进程检查），导致重抽时 sig_004
+--       经常缺失或形态错误；同时规则 6 未明确 qfk_system 系列「禁止顶层 resource」，
+--       偶发 acquire.args 顶层 resource 被 schema(additionalProperties:false) 拒绝。
+-- 修复: 1) sig_003/sig_004 正例对齐真实 KBD，均改为 qfk_system（lsof/ps），
+--           与好数据(kbd_id=1)完全一致；2) 规则 6 显式约束 qfk_system 系列的
+--           目标定位：扁平 host（原 v1 target.scope）/resource_keyword，禁止嵌套 target；
+--           3) 保留规则 11 的说明(instruction)/关键字边界约束；
+--           4) 字段名对齐 v2 扁平契约：command/host/instruction/container/time_window。
+-- 验证: 已在 dev 环境对 kbd_id=1 真实重抽 3 次，均稳定产出 4 个信号
+--       (sig_001 qkv_alert / sig_002 qkv_task / sig_003 qfk_system / sig_004 qfk_system)，
+--       rejected=0，无顶层 resource，description 不泄漏进 resource_keyword/match.pattern。
+-- 幂等: 仅对 name=kbd_extract_signals_v2 生效，无条件覆盖 content_template。
+-- 背景: PR #609 / #608 复盘，dev 库已手动等价 UPDATE 并实证通过。
 -- ===========================================================================
 
 UPDATE system_prompt
@@ -71,8 +74,8 @@ SET
    - qkv_task：必填 keyword；可选 is_failed/limit/timeout/instruction。（is_failed 仅属于 qkv_task，不属于 qkv_alert）
    - qkv_dialog：必填 keyword。
    - qfk_log：resource_keyword（资源/主题选择器，非匹配关键词）；可选 host（支持 {{{{HOST}}}}）/file/path/time_window/timeout/instruction；匹配关键词放 match.pattern。
-   - qfk_service：resource_keyword（服务名选择器）+ container（组 asv/anet/host，默认 asv）；可选 command/timeout/instruction。
-   - qfk_system/vm/network/storage/hardware/platform：command（如 lsof/ps/...，acli <namespace> <command>）；可选 host/resource_keyword/timeout/instruction。
+   - qfk_service：resource_keyword（服务名选择器）+ container（组 asv/anet/host，默认 asv）；可选 command（动作 status/restart 等）/timeout/instruction。
+   - qfk_system/vm/network/storage/hardware/platform：command（如 lsof/ps/...，acli <namespace> <command>）；可选 host（{{{{HOST}}}}）/resource_keyword/timeout/instruction。
    - host 即原 v1 的 target.scope：采集目标主机/作用域，用 {{{{HOST}}}} 占位（变量池解析）或字面 cluster；不要再用嵌套 target 对象。
 7. 写操作安全：若 acquire.tool 为 qfk_* 且 acquire.args.command 命中写/变更动词（start/stop/restart/delete/set/create/...），必须 review.require_human_confirm=true、orchestrate.phase=solution；且只在排查步骤明确描述「处置/修复动作」时才抽取此类信号，纯诊断步骤不要编造写操作。
 8. source_section 只能取 title/problem_description/alert_info/steps_text（根因/解决方案不作为信号来源）；evidence 必须逐字引用输入中的原句，便于审计溯源。
@@ -85,62 +88,75 @@ SET
    - 反例（禁止）：{{"tool":"qfk_storage","args":{{"resource_keyword":"镜像文件占用检查"}}}} ❌
      正例（正确）：{{"tool":"qfk_storage","args":{{"command":"list","resource_keyword":"<实际资源名>","instruction":"镜像文件占用检查"}}}}。
 
-# 输出示例（可直接套用，已对齐全 v2 契约与采集器字段）
+# 输出示例（对齐真实 KBD：虚拟机开机失败→镜像忙→进程占用；已对齐全 v2 契约与采集器字段）
 {{
   "schema_version": 2,
   "signals": [
     {{
       "id": "sig_001",
-      "acquire": {{"tool": "qkv_alert", "args": {{"keyword": "备节点异常", "limit": 100}}}},
+      "acquire": {{"tool": "qkv_alert", "args": {{"keyword": "启动虚拟机失败", "limit": 1, "instruction": "获取虚拟机开机失败告警信息"}}}},
       "match": null,
-      "orchestrate": {{"produces": [{{"name": "HOST", "path": "host"}}, {{"name": "VM", "path": "vm"}}], "requires": []}},
-      "provenance": {{"category": "frontend", "source_section": "steps_text", "evidence": "检查配置存储服务备节点异常告警", "confidence": 0.9}},
+      "orchestrate": {{"phase": "diagnostic", "produces": [{{"name": "STATUS", "path": "status"}}], "requires": []}},
+      "provenance": {{"category": "frontend", "source_section": "alert_info", "evidence": "启动虚拟机失败，错误信息：虚拟机镜像忙", "confidence": 0.8}},
       "review": {{"require_human_confirm": false, "notes": ""}}
     }},
     {{
       "id": "sig_002",
-      "acquire": {{"tool": "qfk_log", "args": {{"resource_keyword": "vgpu", "host": "{{{{HOST}}}}", "timeout": 10}}}},
-      "match": {{"type": "keyword", "pattern": "CPU 资源不足", "mode": "any", "expected": true}},
-      "orchestrate": {{"produces": [], "requires": ["HOST"]}},
-      "provenance": {{"category": "backend", "source_section": "steps_text", "evidence": "若日志含 CPU 资源不足则根因锁定", "confidence": 0.85}},
+      "acquire": {{"tool": "qkv_task", "args": {{"keyword": "启动虚拟机失败", "is_failed": true, "limit": 1, "instruction": "查看虚拟机任务详情确认失败报错信息"}}}},
+      "match": null,
+      "orchestrate": {{"phase": "diagnostic", "produces": [{{"name": "VM", "path": "vm"}}, {{"name": "HOST", "path": "host"}}, {{"name": "STATUS", "path": "status"}}], "requires": []}},
+      "provenance": {{"category": "frontend", "source_section": "steps_text", "evidence": "查看虚拟机任务详情，确认开机失败的报错信息", "confidence": 0.9}},
       "review": {{"require_human_confirm": false, "notes": ""}}
     }},
     {{
       "id": "sig_003",
-      "acquire": {{"tool": "qfk_service", "args": {{"resource_keyword": "{{{{VM.NAME}}}}", "container": "asv", "command": "restart"}}}},
-      "match": {{"type": "state", "pattern": "running", "mode": "any", "expected": true}},
-      "orchestrate": {{"produces": [], "requires": ["VM"], "phase": "solution", "action": "restart"}},
-      "provenance": {{"category": "backend", "source_section": "steps_text", "evidence": "重启虚拟机服务以恢复", "confidence": 0.7}},
-      "review": {{"require_human_confirm": true, "notes": "写操作：重启服务，需人工授权"}}
+      "acquire": {{"tool": "qfk_system", "args": {{"command": "lsof", "resource_keyword": "{{{{VM}}}}", "host": "{{{{HOST}}}}", "instruction": "检查虚拟机镜像文件是否被其他进程占用"}}}},
+      "match": {{"type": "keyword", "pattern": "vm-disk", "mode": "any", "expected": true}},
+      "orchestrate": {{"phase": "diagnostic", "produces": [], "requires": ["VM", "HOST"]}},
+      "provenance": {{"category": "backend", "source_section": "steps_text", "evidence": "检查该虚拟机镜像文件是否被其他进程占用", "confidence": 0.9}},
+      "review": {{"require_human_confirm": false, "notes": ""}}
     }},
     {{
       "id": "sig_004",
-      "acquire": {{"tool": "qfk_storage", "args": {{"command": "list", "instruction": "镜像文件占用检查"}}}},
-      "match": {{"type": "keyword", "pattern": "镜像占用", "mode": "any", "expected": true}},
-      "orchestrate": {{"produces": [], "requires": ["HOST"]}},
-      "provenance": {{"category": "backend", "source_section": "steps_text", "evidence": "检查镜像文件占用情况", "confidence": 0.8}},
+      "acquire": {{"tool": "qfk_system", "args": {{"command": "ps", "host": "{{{{HOST}}}}", "instruction": "查询占用镜像文件的进程详情"}}}},
+      "match": {{"type": "keyword", "pattern": "ClwDRDBClient", "mode": "any", "expected": true}},
+      "orchestrate": {{"phase": "diagnostic", "produces": [], "requires": ["HOST"]}},
+      "provenance": {{"category": "backend", "source_section": "steps_text", "evidence": "查询占用镜像文件的进程详情，确认是否为第三方程序占用", "confidence": 0.9}},
       "review": {{"require_human_confirm": false, "notes": ""}}
+    }},
+    {{
+      "id": "sig_005",
+      "acquire": {{"tool": "qfk_service", "args": {{"resource_keyword": "{{{{VM.NAME}}}}", "container": "asv", "command": "restart"}}}},
+      "match": {{"type": "state", "pattern": "running", "mode": "any", "expected": true}},
+      "orchestrate": {{"phase": "solution", "produces": [], "requires": ["VM"], "action": "restart"}},
+      "provenance": {{"category": "backend", "source_section": "steps_text", "evidence": "重启虚拟机服务以恢复", "confidence": 0.7}},
+      "review": {{"require_human_confirm": true, "notes": "写操作：重启服务，需人工授权"}}
     }}
   ]
-}}$TEMPLATE$,
+}}
+$TEMPLATE$,
     stage = 'KEY',
     updated_at = NOW()
 WHERE name = 'kbd_extract_signals_v2';
+
 
 -- 验证更新结果
 DO $$
 DECLARE
     c text;
-    ok_rule11 boolean;
-    ok_flat boolean;
+    ok_rule6 boolean;
+    ok_sig boolean;
+    ok_nostorage boolean;
+    ok_nosubcmd boolean;
 BEGIN
     SELECT content_template INTO c FROM system_prompt WHERE name = 'kbd_extract_signals_v2';
-    ok_rule11 := c LIKE '%说明(instruction) 与 关键字 的边界%';
-    ok_flat := c LIKE '%command%' AND c LIKE '%instruction%' AND c LIKE '%host%'
-               AND c NOT LIKE '%sub_command%' AND c NOT LIKE '%"description"%';
-    IF ok_rule11 AND ok_flat THEN
-        RAISE NOTICE 'OK 008 kbd_extract_signals_v2: 规则 11 已落地，字段已拍平为 command/instruction/host';
+    ok_rule6 := c LIKE '%host 即原 v1 的 target.scope%';
+    ok_sig := c LIKE '%qfk_system%';
+    ok_nostorage := c NOT LIKE '%"tool": "qfk_storage"%';
+    ok_nosubcmd := c NOT LIKE '%sub_command%';
+    IF ok_rule6 AND ok_sig AND ok_nostorage AND ok_nosubcmd THEN
+        RAISE NOTICE 'OK 009 kbd_extract_signals_v2: sig_004→qfk_system, 字段已拍平为 host/command/instruction';
     ELSE
-        RAISE NOTICE 'WARN 008 kbd_extract_signals_v2: 规则 11=% 扁平化=%', ok_rule11, ok_flat;
+        RAISE NOTICE 'WARN 009 kbd_extract_signals_v2: 修复未完全生效 rule6=% sig=% nostorage=% nosubcmd=%', ok_rule6, ok_sig, ok_nostorage, ok_nosubcmd;
     END IF;
 END $$;
