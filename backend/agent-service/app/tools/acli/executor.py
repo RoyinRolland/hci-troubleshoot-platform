@@ -17,6 +17,7 @@ Bridge Relay 执行器 — 所有 acli/bash 工具的唯一执行后端
 from __future__ import annotations
 
 import json
+import os
 import re
 import shlex
 import string
@@ -28,7 +29,7 @@ from typing import Any
 
 from shared.database.redis import RedisManager
 from shared.observability.logger import get_logger
-from shared.observability.otel import get_current_trace_id
+from shared.observability.otel import get_current_trace_id, get_current_traceparent
 from shared.utils.internal_http import InternalHTTPClient
 
 from app.core.utils import smart_truncate
@@ -72,7 +73,6 @@ class ExecResult:
       node: 执行节点 IP
       duration_ms: 执行耗时（毫秒）
       truncated: stdout 是否被截断
-      stderr_truncated: stderr 是否被截断（完整值使用独立 Redis 缓存）
       risk_level: 本次执行的风险等级（RiskClassifier 判定值）
       exit_code_meaning: 退出码的语义分类
       container: bash_exec 的结构化目标容器
@@ -93,7 +93,16 @@ class ExecResult:
     original_command: str | None = None
     built_command: str | None = None
     exec_id: str | None = None
+    trace_id: str | None = None
+    traceparent: str | None = None
+    artifact_id: str | None = None
+    stdout_sha256: str | None = None
+    stderr_sha256: str | None = None
+    stdout_bytes: int | None = None
+    stderr_bytes: int | None = None
+    stdout_truncated: bool = False
     stderr_truncated: bool = False
+    error_type: str | None = None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -271,7 +280,7 @@ class BridgeRelayExecutor:
       3. risk=3 → 直接拒绝，返回错误
       4. risk=2 → 写 Redis pending，推送 SSE confirm 卡片，等待用户确认
       5. risk=1 → 写 Redis pending，推送 SSE exec 事件
-      6. 通过 Redis blpop 等待前端回传结果（超时 32s）
+      6. 通过 Redis blpop 等待前端回传结果（默认 150s）
       7. 写入 tool_result 表（审计）
 
     使用方法：
@@ -288,8 +297,8 @@ class BridgeRelayExecutor:
     STDOUT_MAX_CHARS = 4000
     STDERR_MAX_CHARS = 1000
 
-    # 默认 Redis 等待超时（秒）；实际命令可通过 execute(timeout=...) 覆盖。
-    BLPOP_TIMEOUT = 30
+    # Bridge 权威执行超时默认 120 秒，浏览器最多等待 135 秒；Agent 再预留 15 秒供结果回传。
+    BLPOP_TIMEOUT = int(os.getenv("AGENT_EXEC_RESULT_TIMEOUT_SECONDS", "150"))
     MAX_EXECUTION_TIMEOUT = 300
 
     def __init__(
@@ -311,7 +320,7 @@ class BridgeRelayExecutor:
         self._internal_token = internal_token
         self._http_client = InternalHTTPClient(
             base_url=self._conversation_service_url,
-            timeout=32.0,  # 略大于 BLPOP_TIMEOUT，确保 HTTP 不先超时
+            timeout=32.0,  # 此客户端只负责快速推送命令，不承载后续 Redis 阻塞等待。
         )
 
     async def aclose(self) -> None:
@@ -356,6 +365,7 @@ class BridgeRelayExecutor:
             ValueError: 命令净化失败
         """
         trace_id = get_current_trace_id() or "unknown"
+        traceparent = get_current_traceparent()
         start_time = time.time()
         exec_id = exec_id or str(uuid.uuid4())
         # 端到端链路：以 exec_id 作为稳定关联键（OTel trace 不存在时回退），
@@ -363,13 +373,11 @@ class BridgeRelayExecutor:
         if trace_id == "unknown":
             trace_id = exec_id
 
-        # 超时由 QFK acquire.args 驱动。这里同时是通用工具的纵深防御边界，避免
-        # 非法值让 Redis 等待与终端桥执行时间失去一致性。
-        requested_timeout = timeout if timeout is not None else args.get("timeout", self.BLPOP_TIMEOUT)
+        requested_timeout = timeout if timeout is not None else args.get("timeout", self.BLPOP_TIMEOUT - 15)
         try:
             execution_timeout = int(requested_timeout)
         except (TypeError, ValueError):
-            execution_timeout = self.BLPOP_TIMEOUT
+            execution_timeout = self.BLPOP_TIMEOUT - 15
         execution_timeout = max(1, min(execution_timeout, self.MAX_EXECUTION_TIMEOUT))
 
         # 1. 提取命令和原因。具体工具命令必须来自 usage_template 或通用 command 参数。
@@ -480,8 +488,7 @@ class BridgeRelayExecutor:
                     original_command=original_command,
                 )
 
-        # acli_exec 通常不带容器；qfk_system 是例外，它把 container 原样传给
-        # terminal_bridge。container="host" 在桥端明确表示不包装、直接在宿主机执行。
+        # acli_exec 通常不带容器；qfk_system 是例外，它把 container 原样传给 terminal_bridge。
         relay_container = built.container if built else (str(args.get("container") or "") or None)
 
         # 3. 风险分类（动态工具）
@@ -547,6 +554,8 @@ class BridgeRelayExecutor:
                     "node_ip": node_ip,
                     "case_id": case_id,  # 以 Agent 运行上下文的工单 ID 为准（不再回退 LLM 参数，避免空串透传）
                     "trace_id": trace_id,  # 端到端链路透传
+                    "traceparent": traceparent or None,
+                    "tool_call_id": exec_id,
                     "timeout": execution_timeout,
                     "output_filters": args.get("output_filters") or [],
                 },
@@ -603,7 +612,7 @@ class BridgeRelayExecutor:
             exec_id=exec_id,
             conversation_id=conversation_id,
             command_preview=cleaned_command[:50],
-            container=relay_container,
+            container=built.container if built else None,
             original_command_preview=(built.original_command if built else original_command)[:80],
             risk_level=runtime_risk,
             policy=runtime_policy,
@@ -614,8 +623,6 @@ class BridgeRelayExecutor:
         result_key = f"exec_result:{exec_id}"
         try:
             # blpop 返回 (key, value) 元组，超时返回 None
-            # 给前端/网络回传保留 5 秒余量；真正的命令时间由 terminal_bridge 的
-            # timeout 强制控制，不能再被此前固定的 30 秒 Redis 等待提前截断。
             result_wait_timeout = execution_timeout + 5
             raw_result = await self._redis.client.blpop(result_key, timeout=result_wait_timeout)
 
@@ -651,18 +658,14 @@ class BridgeRelayExecutor:
 
             # 7. 智能截断输出并提取标准物理流 (Scheme B)
             raw_to_cache = ""
-            raw_stderr_to_cache = ""
-            stderr_truncated = False
             if "stdout" in result_data or "stderr" in result_data:
                 raw_stdout = result_data.get("stdout") or ""
                 raw_stderr = result_data.get("stderr") or ""
                 truncated = len(raw_stdout) > self.STDOUT_MAX_CHARS
-                stderr_truncated = len(raw_stderr) > self.STDERR_MAX_CHARS
                 stdout = smart_truncate(raw_stdout, self.STDOUT_MAX_CHARS) if truncated else raw_stdout
-                stderr = smart_truncate(raw_stderr, self.STDERR_MAX_CHARS) if stderr_truncated else raw_stderr
+                stderr = smart_truncate(raw_stderr, self.STDERR_MAX_CHARS)
                 check_text = f"{raw_stdout}\n{raw_stderr}".lower()
                 raw_to_cache = raw_stdout
-                raw_stderr_to_cache = raw_stderr
             else:
                 # 兼容原有单物理通道合并输出逻辑
                 output = result_data.get("output", "")
@@ -672,10 +675,8 @@ class BridgeRelayExecutor:
 
                 # 当退出码不为0时，认为输出为错误内容，填充到 stderr；stdout 留空（或当 exit_code == 0 时反之）
                 if exit_code != 0:
-                    stderr_truncated = len(output) > self.STDERR_MAX_CHARS
-                    stderr = smart_truncate(output, self.STDERR_MAX_CHARS) if stderr_truncated else output
+                    stderr = smart_truncate(output, self.STDERR_MAX_CHARS)
                     stdout = ""
-                    raw_stderr_to_cache = output
                 else:
                     stderr = ""
                     stdout = smart_truncate(output, self.STDOUT_MAX_CHARS) if truncated else output
@@ -695,30 +696,6 @@ class BridgeRelayExecutor:
                 except Exception as cache_err:
                     logger.warning(
                         event="cmd_output_cache_failed",
-                        exec_id=exec_id,
-                        error=str(cache_err),
-                    )
-
-            # stderr 与 stdout 使用不同缓存键，保持历史 cmd_cache:{exec_id} 只存 stdout
-            # 的契约不变。产出变量读取 stderr 时同样不能使用截断摘要。
-            if stderr_truncated and raw_stderr_to_cache:
-                stderr_cache_key = f"cmd_stderr_cache:{exec_id}"
-                try:
-                    await self._redis.client.setex(
-                        stderr_cache_key,
-                        1800,
-                        raw_stderr_to_cache.encode("utf-8"),
-                    )
-                    logger.info(
-                        event="cmd_stderr_cached",
-                        exec_id=exec_id,
-                        cache_key=stderr_cache_key,
-                        raw_size=len(raw_stderr_to_cache),
-                        truncated_size=self.STDERR_MAX_CHARS,
-                    )
-                except Exception as cache_err:
-                    logger.warning(
-                        event="cmd_stderr_cache_failed",
                         exec_id=exec_id,
                         error=str(cache_err),
                     )
@@ -775,7 +752,16 @@ class BridgeRelayExecutor:
                 original_command=built.original_command if built else original_command,
                 built_command=built.built_command if built else cleaned_command,
                 exec_id=exec_id,
-                stderr_truncated=stderr_truncated,
+                trace_id=result_data.get("trace_id") or trace_id,
+                traceparent=result_data.get("traceparent") or traceparent,
+                artifact_id=result_data.get("artifact_id"),
+                stdout_sha256=result_data.get("stdout_sha256"),
+                stderr_sha256=result_data.get("stderr_sha256"),
+                stdout_bytes=result_data.get("stdout_bytes"),
+                stderr_bytes=result_data.get("stderr_bytes"),
+                stdout_truncated=bool(result_data.get("stdout_truncated", truncated)),
+                stderr_truncated=bool(result_data.get("stderr_truncated", False)),
+                error_type=result_data.get("error_type"),
             )
 
         except Exception as e:

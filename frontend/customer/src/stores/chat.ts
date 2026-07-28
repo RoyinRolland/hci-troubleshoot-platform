@@ -8,7 +8,7 @@ import { createApiClient, createCaseApi, createConversationApi, createAssistantA
 import type { CaseResponse, MessageResponse, AssistantInfo, AssistantsResponse, EnvironmentResponse, EnvironmentContextResponse, EnvType } from '@hci/shared'
 import { getClientId } from '@/utils/clientId'
 import { createEvaluateApi } from '@/api/evaluate'
-import { checkBridgeRunning, checkBridgeBeforeOpen, createBridgeSocket, buildConnectMessage, buildInputMessage, buildDisconnectMessage, stripAnsi, parseJsonOutput, buildAgentExecMessage, buildAgentExecProcessMessage, parseAgentExecResult, type BridgeStatus, type TerminalWsMessage } from '@/api/terminal'
+import { checkBridgeRunning, checkBridgeBeforeOpen, createBridgeSocket, getBridgeUrl, buildConnectMessage, buildInputMessage, buildDisconnectMessage, stripAnsi, parseJsonOutput, buildAgentExecMessage, buildAgentExecProcessMessage, parseAgentExecResult, type BridgeStatus, type TerminalWsMessage, type OutputFilterSpec } from '@/api/terminal'
 import {
   appendExecOutput as appendFilteredExecOutput,
   buildSafeExecResultPayload,
@@ -92,6 +92,23 @@ export const useChatStore = defineStore('chat', () => {
   let bridgeLogRetryCount = 0
   const BRIDGE_LOG_MAX_RETRY = 5
   const BRIDGE_LOG_BASE_DELAY = 500
+  const BRIDGE_LOG_MAX_DELAY = 30_000
+  const BRIDGE_LOG_OUTBOX_KEY = `hci_bridge_log_outbox_${clientId}`
+  try {
+    const persisted = JSON.parse(localStorage.getItem(BRIDGE_LOG_OUTBOX_KEY) || '[]')
+    if (Array.isArray(persisted)) bridgeLogBuffer = persisted
+  } catch {
+    localStorage.removeItem(BRIDGE_LOG_OUTBOX_KEY)
+  }
+
+  function persistBridgeLogOutbox(): void {
+    try {
+      localStorage.setItem(BRIDGE_LOG_OUTBOX_KEY, JSON.stringify(bridgeLogBuffer))
+    } catch (error) {
+      const stats = getBridgeLogStats()
+      setBridgeLogStats({ ...stats, lastError: `outbox_persist_failed: ${String(error)}`.slice(0, 200) })
+    }
+  }
   // C 修复：保留近期回采日志的环形缓冲，供工单创建后将临时会话（ssh-create-temp）日志迁移到真实工单
   let recentBridgeLogs: Record<string, unknown>[] = []
   const RECENT_BRIDGE_LOGS_CAP = 2000
@@ -122,6 +139,7 @@ export const useChatStore = defineStore('chat', () => {
     try {
       await apiClient.post('/bridge-logs', { logs: batch })
       bridgeLogRetryCount = 0 // 成功后重置重试计数
+      persistBridgeLogOutbox()
       // 回采可观测性自检：成功计数暴露到 window，供巡检（消除静默成功）
       const stats = getBridgeLogStats()
       setBridgeLogStats({
@@ -144,15 +162,16 @@ export const useChatStore = defineStore('chat', () => {
         lastErrorAt: new Date().toISOString(),
       })
       if (bridgeLogRetryCount <= BRIDGE_LOG_MAX_RETRY) {
-        const delay = BRIDGE_LOG_BASE_DELAY * Math.pow(2, bridgeLogRetryCount - 1)
+        const delay = Math.min(BRIDGE_LOG_BASE_DELAY * Math.pow(2, bridgeLogRetryCount - 1), BRIDGE_LOG_MAX_DELAY)
         console.warn(`日志回采失败（第 ${bridgeLogRetryCount} 次），${delay}ms 后重试`, e)
         bridgeLogBuffer = batch.concat(bridgeLogBuffer)
+        persistBridgeLogOutbox()
         if (bridgeLogTimer === null) {
           bridgeLogTimer = window.setTimeout(flushBridgeLogs, delay)
         }
       } else {
         console.error('日志回采失败，已达最大重试次数，丢弃日志', batch.length, '条')
-        bridgeLogRetryCount = 0 // 重置计数，下次重新开始
+        bridgeLogRetryCount = 0
       }
     }
   }
@@ -161,6 +180,7 @@ export const useChatStore = defineStore('chat', () => {
     // 仅回采带工单关联的日志，保证落库后可按工单分析
     if (!entry.case_id) return
     bridgeLogBuffer.push(entry)
+    persistBridgeLogOutbox()
     // C 修复：同步写入近期缓冲，供工单创建后将临时会话日志迁移到真实工单
     recentBridgeLogs.push(entry)
     if (recentBridgeLogs.length > RECENT_BRIDGE_LOGS_CAP) {
@@ -175,7 +195,13 @@ export const useChatStore = defineStore('chat', () => {
     if (!fromCaseId || !toCaseId || fromCaseId === toCaseId) return
     const migrating = recentBridgeLogs.filter((e) => e.case_id === fromCaseId)
     if (migrating.length === 0) return
-    const remapped = migrating.map((e) => ({ ...e, case_id: toCaseId }))
+    const remapped = migrating.map((e) => ({
+      ...e,
+      case_id: toCaseId,
+      event_id: undefined,
+      bridge_instance_id: undefined,
+      seq: undefined,
+    }))
     // 从近期缓冲中移除已迁移项，保证幂等（重复调用不会重复落库）
     recentBridgeLogs = recentBridgeLogs.filter((e) => e.case_id !== fromCaseId)
     try {
@@ -334,14 +360,14 @@ export const useChatStore = defineStore('chat', () => {
 
   // === Agent 命令执行结果等待队列 ===
   // 用于 waitForExecResult 函数，存储 execId → resolve 回调
+  type BrowserExecResult = NonNullable<ReturnType<typeof parseAgentExecResult>>
   const pendingExecCallbacks = new Map<string, {
-    resolve: (result: { output: string; exitCode: number; stdout?: string; stderr?: string }) => void
+    resolve: (result: BrowserExecResult) => void
     reject: (error: Error) => void
     timeoutId: number
   }>()
 
-  // 双通道流式缓冲 (Scheme B)
-  // 分块数组避免大输出使用 `+=` 形成 O(n²) 字符串复制。最终只 join 一次。
+  // 双通道流式缓冲 (Scheme B)，使用分块数组和统一预算避免大输出导致 O(n²) 复制。
   const execBuffers = new Map<string, ExecOutputBuffer>()
   const execOutputFilters = new Map<string, ExecOutputFilter[]>()
 
@@ -919,8 +945,8 @@ export const useChatStore = defineStore('chat', () => {
               // T-TOOL-04 + T-TOOL-18: Agent 命令执行请求（SSE → WebSocket → POST 结果）
               try {
                 const event = JSON.parse(data)
-                const { execId, command, reason, riskLevel, nodeIp, container, caseId, conversationId: convId, traceId, outputFilters } = event
-                const timeoutSeconds = Math.min(300, Math.max(1, Number(event.timeout) || 30))
+                const { execId, command, reason, riskLevel, nodeIp, container, caseId, conversationId: convId, traceId, traceparent, toolCallId, outputFilters } = event
+                const timeoutSeconds = Math.min(300, Math.max(1, Number(event.timeout) || 120))
 
                 devLog('agent_exec_command', '收到执行请求', { execId, riskLevel, commandPreview: command.substring(0, 50) })
 
@@ -935,7 +961,7 @@ export const useChatStore = defineStore('chat', () => {
                     timestamp: new Date(),
                     metadata: { kind: 'exec_blocked', execId, command, reason },
                   })
-                  postExecResult(convId, execId, '高危操作已自动阻止', -1, 'blocked').catch((e) => {
+                  postExecResult(convId, execId, '高危操作已自动阻止', -1, 'blocked', undefined, undefined, { traceId, traceparent, errorType: 'policy_blocked' }).catch((e) => {
                     console.warn('[agent_exec_command] postExecResult 失败:', e)
                   })
                   continue
@@ -947,32 +973,31 @@ export const useChatStore = defineStore('chat', () => {
                   // 检查 SSH 连接状态
                   if (sshConnectionState.value !== 'connected' || !sshWebSocket.value) {
                     devLog('agent_exec_command', 'SSH 未连接，无法执行', { execId })
-                    postExecResult(convId, execId, 'SSH 未连接', -1, 'ssh_not_connected').catch((e) => {
+                    postExecResult(convId, execId, 'SSH 未连接', -1, 'ssh_not_connected', undefined, undefined, { traceId, traceparent, errorType: 'ssh_not_connected' }).catch((e) => {
                       console.warn('[agent_exec_command] postExecResult 失败:', e)
                     })
                     continue
                   }
                   // 通过 terminal_bridge WebSocket 发送命令 (双通道：隔离执行)
-                  execOutputFilters.set(execId, Array.isArray(outputFilters) ? outputFilters : [])
-                  // 在发送前创建缓冲区。这样即使旧版 bridge 不发送 exec_stdout/
-                  // exec_stderr 分块、只在最终帧携带完整输出，也会进入统一的
-                  // finalize 路径，不允许大原始输出绕过筛选后回传 HTTP。
+                  execOutputFilters.set(execId, Array.isArray(outputFilters) ? outputFilters as ExecOutputFilter[] : [])
+                  // 在发送前创建缓冲区，确保旧版 Bridge 只发送最终帧时也经过统一筛选和预算。
                   execBuffers.set(execId, createExecOutputBuffer())
                   const waitResult = waitForExecResult(execId, (timeoutSeconds + 5) * 1000)
                   const wsMsg = buildAgentExecProcessMessage(
-                    caseId, execId, command, nodeIp, container, timeoutSeconds, traceId, outputFilters,
+                    caseId, execId, command, nodeIp, container, traceId, traceparent, convId, toolCallId,
+                    timeoutSeconds, Array.isArray(outputFilters) ? outputFilters as OutputFilterSpec[] : undefined,
                   )
                   sshWebSocket.value.send(wsMsg)
                   devLog('agent_exec_command', '命令已发送到 Bridge', { execId, nodeIp, container })
-                  // 监听 exec_result：等待时间与服务端/terminal_bridge 使用同一 timeout。
+                  // Bridge 是权威超时源；浏览器额外预留 5 秒供结果传输与调度。
                   waitResult
                     .then((result) => {
                       devLog('agent_exec_command', '执行完成', { execId, exitCode: result.exitCode })
-                      return postExecResult(convId, execId, result.output, result.exitCode, undefined, result.stdout, result.stderr)
+                      return postExecResult(convId, execId, result.output, result.exitCode, undefined, result.stdout, result.stderr, result)
                     })
                     .catch(() => {
                       devLog('agent_exec_command', '执行超时', { execId })
-                      return postExecResult(convId, execId, 'timeout', -1, 'timeout')
+                      return postExecResult(convId, execId, 'timeout', -1, 'timeout', undefined, undefined, { traceId, traceparent, timedOut: true, errorType: 'browser_wait_timeout' })
                     })
                   continue
                 }
@@ -1033,9 +1058,7 @@ export const useChatStore = defineStore('chat', () => {
         messages.value[idx].content = `[AI 响应失败: ${e.message}]`
       }
     } finally {
-      // SSE 被取消、Pod 重启或上游异常时，不允许工具卡片永久停在 running。
-      // 只有收到同 exec_id 的终态 tool_result 才能显示成功/失败；流结束仍为
-      // running 说明证据链不完整，明确收敛为 failed 并提示重新执行。
+      // SSE 中断或上游异常时，未收到终态的工具卡片必须显式收敛，避免永久显示运行中。
       for (const message of messages.value) {
         const metadata = message.metadata as any
         const event = metadata?.kind === 'tool_call' ? metadata.event : null
@@ -1891,7 +1914,7 @@ export const useChatStore = defineStore('chat', () => {
       socket.onerror = () => {
         devLog('SSH', 'ERROR: WebSocket 错误')
         clearSshAuthTimer()
-        sshErrorMessage.value = 'SSH Bridge 未运行（ws://localhost:9999）'
+        sshErrorMessage.value = `SSH Bridge 未运行（${getBridgeUrl()}）`
         failConnect(new Error('SSH Bridge 未运行'))
       }
 
@@ -1941,7 +1964,7 @@ export const useChatStore = defineStore('chat', () => {
   function waitForExecResult(
     execId: string,
     timeoutMs: number,
-  ): Promise<{ output: string; exitCode: number; stdout?: string; stderr?: string }> {
+  ): Promise<BrowserExecResult> {
     return new Promise((resolve, reject) => {
       // 检查 SSH 连接状态
       if (sshConnectionState.value !== 'connected' || !sshWebSocket.value) {
@@ -1980,6 +2003,7 @@ export const useChatStore = defineStore('chat', () => {
     status?: string,
     stdout?: string,
     stderr?: string,
+    telemetry?: Partial<BrowserExecResult>,
   ): Promise<void> {
     try {
       const response = await fetch(`/api/conversations/${convId}/exec-result`, {
@@ -1987,9 +2011,23 @@ export const useChatStore = defineStore('chat', () => {
         headers: {
           'Content-Type': 'application/json',
           'X-Client-ID': clientId,
+          ...(telemetry?.traceparent ? { traceparent: telemetry.traceparent } : {}),
         },
         body: JSON.stringify({
           ...buildSafeExecResultPayload(execId, output, exitCode, status, stdout, stderr),
+          trace_id: telemetry?.traceId,
+          traceparent: telemetry?.traceparent,
+          stdout_bytes: telemetry?.stdoutBytes,
+          stderr_bytes: telemetry?.stderrBytes,
+          stdout_sha256: telemetry?.stdoutSha256,
+          stderr_sha256: telemetry?.stderrSha256,
+          stdout_truncated: telemetry?.stdoutTruncated,
+          stderr_truncated: telemetry?.stderrTruncated,
+          duration_ms: telemetry?.durationMs,
+          timed_out: telemetry?.timedOut,
+          cancelled: telemetry?.cancelled,
+          error_type: telemetry?.errorType,
+          artifact_id: telemetry?.artifactId,
         }),
       })
 
@@ -2310,7 +2348,7 @@ export const useChatStore = defineStore('chat', () => {
           setupWebSocketResumeHandler(socket)  // 缺陷 6: 重连时自动发送 resume
           devLog('SSH-CREATE', 'WebSocket 对象已创建，等待连接')
           sshCreationSocket.value = socket
-          appendSshCreationLog('info', 'bridge', '开始连接本地 SSH Bridge', { caseId })
+          appendSshCreationLog('info', 'bridge', '开始连接 SSH Bridge', { caseId, bridgeUrl: getBridgeUrl() })
 
           const collectBuffer: Record<string, string> = { cluster: '', alert: '', task: '' }
           let authTimer: number | null = null
@@ -2493,7 +2531,7 @@ export const useChatStore = defineStore('chat', () => {
             devLog('SSH-CREATE', 'WebSocket 连接已打开')
             sshCreationPhase.value = 'connected'
             clearAuthTimer()
-            appendSshCreationLog('info', 'bridge', '本地 SSH Bridge 已连接', {
+            appendSshCreationLog('info', 'bridge', 'SSH Bridge 已连接', {
               caseId,
             })
 
@@ -2584,14 +2622,14 @@ export const useChatStore = defineStore('chat', () => {
 
           socket.onerror = (err) => {
             devLog('SSH-CREATE', 'ERROR: WebSocket 错误', err)
-            appendSshCreationLog('error', 'bridge', '本地 SSH Bridge WebSocket 连接失败')
-            rejectFlow(createFlowError('本地 SSH Bridge 未运行', '浏览器无法连接 ws://localhost:9999'))
+            appendSshCreationLog('error', 'bridge', 'SSH Bridge WebSocket 连接失败')
+            rejectFlow(createFlowError('SSH Bridge 未运行', `浏览器无法连接 ${getBridgeUrl()}`))
           }
 
           socket.onclose = (event) => {
             devLog('SSH-CREATE', 'WebSocket 关闭', { code: event.code, reason: event.reason, phase: sshCreationPhase.value })
             if (!flowSettled && sshCreationPhase.value !== 'done' && sshCreationPhase.value !== 'error') {
-              appendSshCreationLog('warn', 'bridge', '本地 SSH Bridge 连接异常关闭', {
+              appendSshCreationLog('warn', 'bridge', 'SSH Bridge 连接异常关闭', {
                 code: event.code,
                 reason: event.reason || '',
               })

@@ -1343,28 +1343,132 @@ grep -n '\$TEMPLATE\$' database/seeds/02_system_prompts.sql
 
 ---
 
-## D-015：临时 ConfigMap `subPath` 覆盖镜像源码，导致“新镜像、旧运行代码”
+## D-015：Dockerfile 与构建脚本的 build context 基准不一致
 
-**触发场景**：为紧急排障直接执行 `kubectl create configmap` 和 `kubectl patch deployment`，将 Python 文件以 `subPath` 挂载到镜像的 `/app/app/*.py` 或 `/app/shared/*.py`。随后正式 PR 已合并、镜像 tag 已升级、Pod 也已重建，但业务行为仍与旧版本一致。
+**触发场景**：Dockerfile 使用 `COPY backend/...`、`COPY frontend/...` 等仓库根相对路径，但构建脚本把 `backend/` 或 `frontend/` 子目录传给 `docker build` 作为 context。
 
-**症状**：ArgoCD 显示 `Synced / Healthy`，Pod image 已是最新 commit 对应 tag；但 Deployment 的 `volumeMounts` 中出现 `/app/app/...py` 或 `/app/shared/...py`，并指向临时 `cdd-*-code-*` ConfigMap。其 `managedFields.manager` 是 `kubectl-create` / `kubectl-patch`，而非 Helm/ArgoCD。
+**症状**：
 
-**根因**：镜像文件系统先提供新源码；Kubernetes 再把 `subPath` 挂载到同一路径，后者覆盖前者。镜像 tag、健康探针和普通 HTTP 冒烟都无法证明运行时文件未被覆盖；资源级 prune 也不能替代对外部 patch 字段的治理。
+- `docker build --quiet` 长时间没有输出，看似卡在第一张镜像；
+- 子目录没有自己的 `.dockerignore` 时，Docker 会先发送其中的 `.venv`、缓存和构建产物，耗时和空间异常增加；
+- 上下文发送完后才报 `COPY failed`、`not found` 或 BuildKit 的 `failed to calculate checksum`；
+- 同一个 Dockerfile 在仓库根手工构建成功，在脚本中失败。
 
-**排查步骤**：
+**根因**：`COPY` 源路径只能访问 build context 内的文件，并且相对路径以 context 根为基准。Dockerfile 路径由 `-f` 指定，不会改变 `COPY` 的基准目录。以 `backend/` 为 context 时，`COPY backend/shared /app/shared` 实际寻找的是 `<repo>/backend/backend/shared`。
+
+**正确做法**：
 
 ```bash
-# 先看运行态挂载，而不是只看 image tag
-kubectl -n <ns> get deploy <service> -o json \
-  | jq '.spec.template.spec.containers[].volumeMounts'
-
-# kubectl-patch 表明存在绕过 GitOps 的热补丁
-kubectl -n <ns> get deploy <service> -o json --show-managed-fields \
-  | jq '.metadata.managedFields[] | select(.manager == "kubectl-patch")'
+# Dockerfile 的 COPY 以仓库根为基准，因此最后一个参数必须是仓库根。
+docker build \
+  -f "${PROJECT_ROOT}/backend/api-gateway/Dockerfile" \
+  -t hci-api-gateway:dev-local \
+  "${PROJECT_ROOT}"
 ```
 
-**修复方法**：先准确核实 ConfigMap 仅被目标工作负载引用，再删除 Deployment 的对应 `volumeMount` 和 `volume`，等待滚动更新并在 Pod 内验证源码，最后删除废弃 ConfigMap。不要把新文件继续写回旧 ConfigMap——那只会延续双重发布源。
+构建清单中的主仓服务应统一使用 `PROJECT_ROOT` context；只有来自独立仓库、且 Dockerfile 的 `COPY` 也以该独立仓库为基准时，才使用其他 context。
 
-**预防**：`hci-platform-infra` 的 `ValidatingAdmissionPolicy` `hci-platform-deny-runtime-source-overrides` 已在 `hci-dev` / `hci-staging` / `hci-prod` 生效。它以 `Deny` 阻止 Deployment、StatefulSet、DaemonSet 将任何卷挂载到 `/app/app/`、`/app/shared/` 或 `*.py`。修复只能构建不可变镜像，经 PR + GitOps 发布。
+**预防检查**：
 
-**参考案例**：2026-07-27 工单 `Q2026072748256`。PR #628 的新镜像已部署，但 2026-07-26 的 `cdd-conversation-code-*`、`cdd-kb-code-*`、`cdd-agent-code-*` 覆盖了三个服务源码，造成 KBD 门禁仍要求 `matcher`、人工升级确认仍错误回传 ops-agent。详见 [部署事件](../events/2026-07-27-运行时代码完整性修复与防护.md)。
+- 修改 Dockerfile 或构建清单时，对照每条 `COPY` 的第一个路径检查 context 是否包含它；
+- 根 `.dockerignore` 只在仓库根作为 context 时生效，不能假设它会自动作用于子目录 context；
+- CI 至少对一张 Python、一张前端和新增运行时镜像执行真实构建，Helm lint 无法发现此类问题；
+- 无输出的 `--quiet` 构建先用 `ps` 检查是否仍在发送 context，排障时可临时去掉 `--quiet`。
+
+**参考案例**：2026-07-27 dev K3s Terminal Bridge P0 部署时，`scripts/ops/k3s-build.sh` 的 Python/前端清单使用子目录 context，而对应 Dockerfile 均使用仓库根相对 `COPY`。统一到仓库根后恢复缓存过滤和可构建性。
+
+---
+
+## D-017：日志采集器首次启动回放过期 CRI 日志导致 Loki 整批拒绝
+
+**触发场景**：以 Alloy 替换 Promtail，或清空 Alloy positions 后首次挂载已有的 `/var/log/pods`。节点上保留的 CRI 日志早于 Loki 的 `reject_old_samples_max_age`，而文件采集器默认从文件头读取。
+
+**症状**：
+
+- Alloy DaemonSet Ready、River 配置解析成功，但日志持续出现 `final error sending batch`；
+- Loki 返回 HTTP 400，错误包含 `timestamp too old` 和 `oldest acceptable timestamp`；
+- 新日志可能与过期日志同批发送，导致迁移期间的可观测性存在缺口；
+- 仅检查 Pod Ready 会误判采集链路已经可用。
+
+**根因**：新的采集器没有旧 Promtail 的 positions。首次发现历史 CRI 文件时从 offset 0 回放，而 Loki 默认拒绝超过保留窗口的样本。采集器进程健康与日志写入成功是两个不同的验收层级。
+
+**修复方法**：在 `loki.source.file` 设置 `tail_from_end = true`。该设置只在文件没有既有 position 时从文件尾开始；正常运行后仍由 Alloy 持久化 position 并连续采集新内容。若错误启动已经生成 position，需要清理该次错误迁移产生的 Alloy position，或使用新的空 storage path 后重启一次。
+
+```alloy
+loki.source.file "pod_logs" {
+  targets       = local.file_match.pod_logs.targets
+  tail_from_end = true
+  forward_to    = [loki.process.pod_logs.receiver]
+}
+```
+
+**验收标准**：
+
+1. Alloy 日志在切换后不再出现新的 `timestamp too old` / `final error sending batch`；
+2. 主动生成一条带唯一标识的新日志，并在 Loki 中按 namespace/service/标识查询到；
+3. 确认时间戳、结构化 metadata 和原始 JSON 内容正确；
+4. 上述三项通过后才能删除 Promtail，避免双采或采集空窗。
+
+**参考案例**：2026-07-27 dev K3s 将 Promtail 3.4.2 替换为 Alloy 1.10.2 时，节点存在 14 天前日志，而 Loki 最早只接受 7 天内样本。Alloy 虽 Ready，但真实写入返回 HTTP 400；设置 `tail_from_end` 并重建初始 position 后恢复。
+
+---
+
+## D-018：ConfigMap subPath 挂载后热 reload 仍读取旧 inode
+
+**场景**：应用把 ConfigMap 中的单个文件通过 `subPath` 挂载，例如 Prometheus 的
+`/etc/prometheus/prometheus.yml`。修改 ConfigMap 后调用应用热加载端点。
+
+**症状**：ConfigMap 内容已经正确，`POST /-/reload` 也返回成功，但运行时配置和 targets 完全不变。
+
+**根因**：Kubernetes 更新 ConfigMap volume 时切换的是投影目录中的符号链接/inode；`subPath` bind mount
+固定在 Pod 创建时的旧 inode，不会跟随切换。应用热加载只是重新读取容器内旧文件，因此无法看到新配置。
+
+**处理与验收**：
+
+1. 先确认 Deployment 使用了 `subPath`，再确认 ConfigMap 新值正确；
+2. 执行 `kubectl rollout restart deployment/<name>`，而不是重复调用 reload；
+3. 同时从运行时配置 API 和 target API 验证新值；
+4. 对需要频繁热更新的配置，优先挂载整个目录，或引入配置 reloader sidecar。
+
+**参考案例**：2026-07-27 dev Prometheus 的抓取 namespace 从错误的 `hci` 修正为 `hci-dev` 后，
+`/-/reload` 未生效；滚动重启后 `hci-dev` 业务 targets 从 0 恢复到 9。
+
+---
+
+## D-019：App-of-Apps 双层 selfHeal 覆盖本地联调运行态
+
+**场景**：dev K3s 同时由根 Application 和子 Application 开启 automated selfHeal，本地需要临时部署
+尚未进入远端 main 的镜像、Helm 值或 ConfigMap 进行端到端验收。
+
+**症状**：手工修改短暂生效后又自动回滚；只暂停子 Application 后，父 Application 又把子级策略恢复；
+Pod 镜像、Prometheus namespace 或观测组件在测试途中漂移。
+
+**根因**：App-of-Apps 中父层管理子 Application 的声明，子层管理业务资源。只暂停一层不能阻止另一层收敛。
+
+**处理与验收**：
+
+1. 明确父子资源所有权，逐层移除 `spec.syncPolicy.automated`；
+2. 记录暂停对象、原策略、本地偏差、恢复前置条件和负责人；
+3. 验收期间持续检查 Application spec，不能只看一次 UI 状态；
+4. 本地改动通过 PR 进入远端并完成同步后，先清除临时运行态，再按原值恢复 selfHeal；
+5. 禁止把“暂停自愈”当作长期部署方案。
+
+**参考案例**：Terminal Bridge P0 本地验收同时暂停 `argocd-root`、`hci-platform-dev` 和
+`hci-platform-obs-dev`，待业务代码与环境仓值进入远端后才能恢复。
+
+---
+
+## D-020：临时 ConfigMap subPath 覆盖镜像源码，造成“新镜像、旧运行代码”
+
+**触发场景**：为紧急排障直接创建 ConfigMap 并通过 `subPath` 将 Python 源码挂载到容器的
+`/app/app/` 或 `/app/shared/` 路径，随后正式镜像虽然升级，运行时仍读取被覆盖的旧文件。
+
+**排查与修复**：先检查 Deployment/StatefulSet/DaemonSet 的 `volumeMounts` 和 managed fields，确认是否存在
+`kubectl-patch` 或临时 ConfigMap；删除对应挂载和 ConfigMap，滚动重启并在 Pod 内核验源码版本。禁止继续修改旧
+ConfigMap 作为发布方式，正式修复必须构建不可变镜像，经 PR 和 GitOps 发布。
+
+**预防**：通过 `ValidatingAdmissionPolicy` 阻止卷挂载到 `/app/app/`、`/app/shared/` 或 `*.py`，避免运行时源码
+覆盖镜像内容。
+
+**参考案例**：2026-07-27 dev 环境运行时代码完整性修复。该类问题会使镜像 tag、探针和 ArgoCD Healthy 状态
+与实际执行源码不一致，必须纳入部署验收。
