@@ -39,6 +39,44 @@ interface KbdEntry {
   ai_category_label?: string | null
   // 关键信号集合：后端 GET 直出标准化 v2 文档 {schema_version, signals}（前端原生读 v2，RFC §7）
   signals_json?: SignalsDoc | null
+  latest_proposal_revision_id?: number | null
+  working_revision_id?: number | null
+  lock_version?: number
+}
+
+interface RevisionMetadata {
+  id: number
+  revision_no: number
+  revision_type: 'proposal' | 'expert'
+  checksum: string
+  created_at?: string | null
+  diff_from_parent?: Array<{ operation: string; path: string }>
+}
+
+interface KbdRevisionState {
+  latest_proposal_revision_id: number | null
+  working_revision_id: number | null
+  lock_version: number
+  history: RevisionMetadata[]
+  active_resource: { revision: number; checksum: string; version: string } | null
+}
+
+interface CapabilityDescriptor {
+  capability_id: string
+  kind: 'producer' | 'consumer'
+  contract_status: string
+  runtime_status: string
+  verification_status: string
+  args_schema: Record<string, any>
+}
+
+interface CandidateValidation {
+  status: 'ok' | 'warning' | 'error'
+  publishable: boolean
+  runtime_verified: boolean
+  error_count: number
+  warning_count: number
+  issues: Array<{ level: string; code: string; location: string; message: string }>
 }
 
 // ============ 关键信号 v2 数据模型（RFC §7 前端原生读 v2 对象化，2026-07-22） ============
@@ -46,6 +84,7 @@ interface KbdEntry {
 // 回写时仍发回完整 v2 文档（{schema_version, signals}），后端 update_kbd_entry 幂等归约。
 interface SignalV2 {
   id?: number | string
+  role?: 'must' | 'should' | 'exclude' | 'context'
   acquire: { tool: string; args: Record<string, any> }
   match: { type?: string; pattern?: string; mode?: string; expected?: boolean } | null
   orchestrate: Record<string, any>
@@ -55,6 +94,9 @@ interface SignalV2 {
 interface SignalsDoc {
   schema_version: number
   signals: SignalV2[]
+  rejected_candidates?: Array<{ candidate: unknown; reason: string }>
+  verification_contract?: Record<string, any>
+  generation_metadata?: Record<string, any>
 }
 
 // 图片描述项（images_json 数组元素）
@@ -62,6 +104,9 @@ interface ImageJsonItem {
   seq: number           // 图片序号
   section: string       // 所属章节字段
   desc: string          // desc.txt v3 内容
+  context_before?: string // 图片前方原文上下文（Evidence provenance）
+  context_after?: string  // 图片后方原文上下文（Evidence provenance）
+  evidence?: Record<string, unknown> // Vision Evidence IR
 }
 
 // 生成深信服案例原始页面 URL
@@ -91,14 +136,14 @@ interface ScreenshotFields {
   // ── v2 字段（PaddleOCR + LLM 双引擎新格式）─────────────────────────────────
   /** 背景颜色（黑色/白色/其他），后端 Pillow 采样决定 */
   background: string
-  /** 截图类型（终端截图/日志截图/告警截图/任务截图/其他截图），后端 LLM 权威判断 */
+  /** 截图类型（终端/日志/告警/任务/弹框/配置/其他截图），后端识别结果 */
   screenshotType: string
   /** PaddleOCR 全量文字行 */
   fullText: string[]
   /**
    * 截断后的可见内容（根据截图类型决定方向）：
    *   终端/日志截图 → FULL_TEXT 后 N 行（最新输出在末尾）
-   *   告警/任务截图 → FULL_TEXT 前 N 行（最新内容在最前）
+   *   告警/任务/弹框/配置截图 → FULL_TEXT 前 N 行（最新内容在最前）
    */
   visibleContent: string[]
   /** 类型相关关键内容（KEY 字段）：终端→命令返回；日志→错误日志；告警→重要告警；任务→失败任务 */
@@ -221,9 +266,24 @@ interface ParsedImageJson {
   fullText: string[]
   visibleContent: string[]
   description: string
+  contextBefore: string
+  contextAfter: string
+  observedFacts: string[]
+  inferences: string[]
+  qualityStatus: string
+  needsReview: boolean
+  inferenceStatus: string
+  inferenceNeedsReview: boolean
+  inferenceIssues: string[]
+  provenance: Record<string, any>
   expanded: boolean
 }
 const parsedImagesJson = ref<ParsedImageJson[]>([])
+const revisionState = ref<KbdRevisionState | null>(null)
+const revisionLoading = ref(false)
+const capabilityMap = ref<Record<string, CapabilityDescriptor>>({})
+const candidateValidation = ref<CandidateValidation | null>(null)
+const candidateValidationLoading = ref(false)
 
 // 拒绝弹窗
 const rejectDialogVisible = ref(false)
@@ -310,8 +370,9 @@ async function handleApprove(entry: KbdEntry) {
       headers: { 'Content-Type': 'application/json', ...authHeader },
       body: JSON.stringify({
         reviewer_id: currentUser.value,
-        review_note: entry.review_note || '',
+        review_note: reviewNote.value || '',
         category_id: editableCategoryId.value || entry.ai_category_id || null,
+        lock_version: entry.lock_version,
       }),
     })
     if (!resp.ok) {
@@ -330,6 +391,60 @@ async function handleApprove(entry: KbdEntry) {
     if (msg === 'cancel') return
     ElMessage.error(msg || '操作失败，请重试')
   }
+}
+
+async function fetchCapabilities() {
+  try {
+    const resp = await fetch('/api/v1/kbd/capabilities', { headers: authHeader })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const document = await resp.json()
+    capabilityMap.value = Object.fromEntries(
+      (document.capabilities || []).map((item: CapabilityDescriptor) => [item.capability_id, item]),
+    )
+  } catch {
+    capabilityMap.value = {}
+  }
+}
+
+async function fetchRevisionState(kbdId: number) {
+  revisionLoading.value = true
+  try {
+    const resp = await fetch(`/api/v1/kbd/${kbdId}/revisions`, { headers: authHeader })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    revisionState.value = await resp.json()
+  } catch {
+    revisionState.value = null
+  } finally {
+    revisionLoading.value = false
+  }
+}
+
+async function validateCurrentCandidate(options: { silent?: boolean } = {}) {
+  if (!detailEntry.value) return
+  candidateValidationLoading.value = true
+  try {
+    const resp = await fetch(`/api/v1/kbd/${detailEntry.value.id}/validate`, {
+      method: 'POST',
+      headers: authHeader,
+    })
+    const body = await resp.json().catch(() => ({}))
+    if (!resp.ok) throw new Error(typeof body?.detail === 'string' ? body.detail : `HTTP ${resp.status}`)
+    candidateValidation.value = body
+    if (!options.silent) {
+      if (body.status === 'ok') ElMessage.success('当前专家稿校验通过')
+      else if (body.status === 'warning') ElMessage.warning(`无阻断错误，但有 ${body.warning_count} 条运行能力提示`)
+      else ElMessage.error(`发现 ${body.error_count} 个阻断问题，请按提示修复`)
+    }
+  } catch (error) {
+    candidateValidation.value = null
+    if (!options.silent) ElMessage.error(error instanceof Error ? error.message : '校验失败')
+  } finally {
+    candidateValidationLoading.value = false
+  }
+}
+
+function capabilityStatus(tool: string): 'declared' | 'missing' {
+  return capabilityMap.value[tool] ? 'declared' : 'missing'
 }
 
 function openRejectDialog(entry: KbdEntry) {
@@ -587,6 +702,9 @@ async function openDetailDialog(entry: KbdEntry) {
   editingContent.value = false
   clearStagedSignalEdits()
   cancelEditSignal()
+  revisionState.value = null
+  candidateValidation.value = null
+  void fetchRevisionState(entry.id)
   // 拉取完整详情（确保含 signals_json）
   try {
     const resp = await fetch(`/api/v1/kbd/${entry.id}`, { headers: authHeader })
@@ -599,6 +717,7 @@ async function openDetailDialog(entry: KbdEntry) {
       parsedSegments.value = parseContentMd(fresh.content_md || '')
       parsedImagesJson.value = parseImagesJson(fresh.images_json || [])
       associateSegmentsWithSeq(parsedSegments.value, parsedImagesJson.value)
+      void validateCurrentCandidate({ silent: true })
       return
     }
   } catch {
@@ -611,6 +730,7 @@ async function openDetailDialog(entry: KbdEntry) {
   parsedSegments.value = parseContentMd(entry.content_md || '')
   parsedImagesJson.value = parseImagesJson(entry.images_json || [])
   associateSegmentsWithSeq(parsedSegments.value, parsedImagesJson.value)
+  void validateCurrentCandidate({ silent: true })
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -621,6 +741,20 @@ function sigTool(sig: SignalV2): string { return sig.acquire?.tool || '' }
 function sigArgs(sig: SignalV2): Record<string, any> { return sig.acquire?.args || {} }
 function sigMatch(sig: SignalV2): Record<string, any> { return sig.match || {} }
 function sigOrch(sig: SignalV2): Record<string, any> { return sig.orchestrate || {} }
+function sigProvenance(sig: SignalV2): Record<string, any> { return sig.provenance || {} }
+function sigSourceRefs(sig: SignalV2): string[] {
+  const refs = sigProvenance(sig).source_refs
+  return Array.isArray(refs) ? refs.map((item) => String(item)) : []
+}
+function sigRoleLabel(sig: SignalV2): string {
+  return ({ must: '必要证据', should: '增强证据', exclude: '排除证据', context: '上下文' } as Record<string, string>)[sig.role || ''] || '未分配'
+}
+function qualityTagType(status: string): 'success' | 'warning' | 'danger' | 'info' {
+  if (status === 'success') return 'success'
+  if (status === 'failed') return 'danger'
+  if (['partial', 'low_quality', 'needs_review'].includes(status)) return 'warning'
+  return 'info'
+}
 function isBackendSig(sig: SignalV2): boolean {
   return sigTool(sig).startsWith('qfk') || sig.provenance?.category === 'backend'
 }
@@ -653,6 +787,12 @@ const signalList = computed<SignalV2[]>(() => {
   const source = (detailEntry.value?.signals_json as SignalsDoc | undefined)?.signals || []
   return source.map((signal, index) => stagedSignalEdits.value[index] || signal)
 })
+const signalGenerationMetadata = computed<Record<string, any>>(
+  () => (detailEntry.value?.signals_json as SignalsDoc | undefined)?.generation_metadata || {},
+)
+const rejectedSignalCandidates = computed(
+  () => (detailEntry.value?.signals_json as SignalsDoc | undefined)?.rejected_candidates || [],
+)
 const producerSignals = computed(() =>
   signalList.value.map((s, i) => ({ sig: s, origIdx: i })).filter((x) => !isBackendSig(x.sig)),
 )
@@ -903,11 +1043,14 @@ async function saveSignalEdit() {
       return
     }
     // 回写完整 v2 文档（后端 update_kbd_entry 幂等归约），不再发扁平 list
-    const payload: SignalsDoc = { schema_version: 2, signals: list }
+    const currentDoc = (detailEntry.value.signals_json || {}) as SignalsDoc
+    // 手工编辑只替换 signals，必须保留 Contract、生成指纹和拒绝候选审计记录。
+    // 后端会把 generation_metadata.status 收敛为 manual_reviewed。
+    const payload: SignalsDoc = { ...currentDoc, schema_version: 2, signals: list }
     const resp = await fetch(`/api/v1/kbd/${detailEntry.value.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', ...authHeader },
-      body: JSON.stringify({ signals_json: payload }),
+      body: JSON.stringify({ signals_json: payload, lock_version: detailEntry.value.lock_version }),
     })
     if (!resp.ok) {
       let detail = `HTTP ${resp.status}`
@@ -924,6 +1067,9 @@ async function saveSignalEdit() {
     const updated = (await resp.json()) as any
     const newDoc: SignalsDoc = updated?.signals_json || payload
     detailEntry.value.signals_json = newDoc
+    detailEntry.value.lock_version = updated?.lock_version ?? detailEntry.value.lock_version
+    void fetchRevisionState(detailEntry.value.id)
+    void validateCurrentCandidate({ silent: true })
     const idx = entries.value.findIndex((e) => e.id === detailEntry.value!.id)
     if (idx !== -1) entries.value[idx].signals_json = newDoc
     ElMessage.success('关键信号已保存')
@@ -968,7 +1114,7 @@ async function submitEdit() {
   if (!editingEntry.value) return
   editLoading.value = true
   try {
-    const payload: Record<string, string> = {}
+    const payload: Record<string, unknown> = {}
     if (editTitle.value.trim() && editTitle.value !== editingEntry.value.title) {
       payload.title = editTitle.value.trim()
     }
@@ -982,6 +1128,9 @@ async function submitEdit() {
       ElMessage.info('内容未变更')
       editDialogVisible.value = false
       return
+    }
+    if (typeof editingEntry.value.lock_version === 'number') {
+      payload.lock_version = editingEntry.value.lock_version
     }
     const resp = await fetch(`/api/v1/kbd/${editingEntry.value.id}`, {
       method: 'PATCH',
@@ -1074,6 +1223,8 @@ function renderMarkdown(md: string): string {
 function typeNameToInfo(typeName: string): ScreenshotTypeInfo {
   if (/告警截图/.test(typeName)) return { label: '告警截图', color: '#E6A23C', bgColor: '#FEF7EC', icon: '🔔' }
   if (/任务截图/.test(typeName)) return { label: '任务截图', color: '#409EFF', bgColor: '#EEF6FF', icon: '📋' }
+  if (/弹框截图/.test(typeName)) return { label: '弹框截图', color: '#F56C6C', bgColor: '#FEF0F0', icon: '💬' }
+  if (/配置截图/.test(typeName)) return { label: '配置截图', color: '#00A6A6', bgColor: '#E8F8F8', icon: '⚙️' }
   if (/终端截图/.test(typeName)) return { label: '终端截图', color: '#722ED1', bgColor: '#F5EEFF', icon: '💻' }
   if (/日志截图/.test(typeName)) return { label: '日志截图', color: '#67C23A', bgColor: '#F0F9EB', icon: '📄' }
   return { label: '其他截图', color: '#909399', bgColor: '#F5F7FA', icon: '🖼️' }
@@ -1104,6 +1255,8 @@ function getErrorLabelByType(screenshotType: string): string {
   if (/日志截图/.test(screenshotType)) return '错误日志'
   if (/告警截图/.test(screenshotType)) return '重要告警'
   if (/任务截图/.test(screenshotType)) return '失败任务'
+  if (/弹框截图/.test(screenshotType)) return '弹框信息'
+  if (/配置截图/.test(screenshotType)) return '配置状态'
   return '相关信息'
 }
 
@@ -1412,11 +1565,15 @@ async function saveInlineEdit() {
     const resp = await fetch(`/api/v1/kbd/${detailEntry.value.id}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', ...authHeader },
-      body: JSON.stringify({ content_md: newContent }),
+      body: JSON.stringify({ content_md: newContent, lock_version: detailEntry.value.lock_version }),
     })
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const responseBody = await resp.json().catch(() => ({}))
+    if (!resp.ok) throw new Error(typeof responseBody?.detail === 'string' ? responseBody.detail : `HTTP ${resp.status}`)
     // 同步更新本地状态
     detailEntry.value.content_md = newContent
+    detailEntry.value.lock_version = responseBody?.lock_version ?? detailEntry.value.lock_version
+    void fetchRevisionState(detailEntry.value.id)
+    void validateCurrentCandidate({ silent: true })
     const idx = entries.value.findIndex((e) => e.id === detailEntry.value!.id)
     if (idx !== -1) entries.value[idx].content_md = newContent
     // 重新解析内容预览
@@ -1498,6 +1655,15 @@ function parseImagesJson(images: ImageJsonItem[]): ParsedImageJson[] {
     // 解析 DESCRIPTION
     const descMatch = desc.match(/DESCRIPTION:\s*\n(.+?)(?=\n[A-Z_]+:|$)/s)
     const description = descMatch ? descMatch[1].trim() : ''
+    const evidence = (img.evidence || {}) as Record<string, any>
+    const regions = Array.isArray(evidence.regions) ? evidence.regions : []
+    const observedFacts = regions.flatMap((region: Record<string, any>) =>
+      Array.isArray(region.observed_facts) ? region.observed_facts.map((item: unknown) => String(item)) : [],
+    )
+    const inferences = regions.flatMap((region: Record<string, any>) =>
+      Array.isArray(region.inferences) ? region.inferences.map((item: unknown) => String(item)) : [],
+    )
+    const quality = (evidence.quality || {}) as Record<string, any>
 
     return {
       seq: img.seq,
@@ -1507,6 +1673,18 @@ function parseImagesJson(images: ImageJsonItem[]): ParsedImageJson[] {
       fullText,
       visibleContent,
       description: description || '（无描述）',
+      contextBefore: String(img.context_before || evidence.context_before || ''),
+      contextAfter: String(img.context_after || evidence.context_after || ''),
+      observedFacts,
+      inferences,
+      qualityStatus: String(quality.status || (desc ? 'legacy' : 'failed')),
+      needsReview: Boolean(quality.needs_review || !img.evidence),
+      inferenceStatus: String(quality.inference_status || (inferences.length ? 'legacy_unverified' : 'not_present')),
+      inferenceNeedsReview: Boolean(quality.inference_needs_review || inferences.length),
+      inferenceIssues: Array.isArray(quality.inference_issues)
+        ? quality.inference_issues.map((item: unknown) => String(item))
+        : [],
+      provenance: (evidence.provenance || {}) as Record<string, any>,
       expanded: false,
     }
   }).sort((a, b) => a.seq - b.seq)
@@ -1521,6 +1699,7 @@ const metaKeys: (keyof KbdMetadata)[] = [
 onMounted(() => {
   fetchPending()
   fetchCategories()
+  fetchCapabilities()
 })
 </script>
 
@@ -1748,6 +1927,14 @@ onMounted(() => {
         </div>
       </template>
       <template v-if="detailEntry">
+        <el-alert
+          v-if="detailEntry.status === 'published'"
+          type="info"
+          :closable="false"
+          show-icon
+          title="当前生效版继续由 Agent 使用；已发布维护将通过独立工作稿完成，普通保存不会再静默热发布。"
+          style="margin-bottom: 12px"
+        />
         <!-- 基本信息 -->
         <el-descriptions :column="2" border size="small">
           <el-descriptions-item label="案例 ID">
@@ -1821,6 +2008,57 @@ onMounted(() => {
           </el-descriptions-item>
         </el-descriptions>
 
+        <div class="section-block" v-loading="revisionLoading">
+          <div class="section-header-row">
+            <h4 class="section-title">版本、生效与即时校验</h4>
+            <el-button
+              size="small"
+              type="primary"
+              plain
+              :loading="candidateValidationLoading"
+              @click="validateCurrentCandidate()"
+            >验证当前内容</el-button>
+          </div>
+          <el-descriptions :column="3" border size="small">
+            <el-descriptions-item label="模型 Proposal">
+              <span v-if="revisionState?.latest_proposal_revision_id">#{{ revisionState.latest_proposal_revision_id }}</span>
+              <span v-else class="text-muted">首次编辑/发布时自动固化</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="专家工作稿">
+              <span v-if="revisionState?.working_revision_id">#{{ revisionState.working_revision_id }}</span>
+              <span v-else class="text-muted">尚未修改</span>
+            </el-descriptions-item>
+            <el-descriptions-item label="Agent 当前生效">
+              <span v-if="revisionState?.active_resource">
+                runtime r{{ revisionState.active_resource.revision }} · {{ revisionState.active_resource.checksum.slice(0, 10) }}
+              </span>
+              <span v-else class="text-muted">未生效</span>
+            </el-descriptions-item>
+          </el-descriptions>
+          <div class="section-hint" style="margin-top: 8px">
+            保存只形成专家工作版本；只有“审核通过并发布”才切换 Agent 生效 revision。
+            <template v-if="revisionState?.history?.[0]?.diff_from_parent?.length">
+              当前专家稿相对基线修改 {{ revisionState.history[0].diff_from_parent.length }} 项。
+            </template>
+          </div>
+          <el-alert
+            v-if="candidateValidation"
+            :type="candidateValidation.status === 'error' ? 'error' : candidateValidation.status === 'warning' ? 'warning' : 'success'"
+            :closable="false"
+            show-icon
+            style="margin-top: 10px"
+            :title="candidateValidation.status === 'ok'
+              ? '当前内容静态校验通过'
+              : `发现 ${candidateValidation.error_count} 个错误、${candidateValidation.warning_count} 个运行能力提示`"
+          >
+            <ul v-if="candidateValidation.issues.length" class="validation-issue-list">
+              <li v-for="issue in candidateValidation.issues" :key="`${issue.code}-${issue.location}`">
+                <code>{{ issue.location }}</code>：{{ issue.message }}
+              </li>
+            </ul>
+          </el-alert>
+        </div>
+
         <!-- 元数据面板 -->
         <div class="section-block">
           <h4 class="section-title">来源元数据</h4>
@@ -1858,6 +2096,33 @@ onMounted(() => {
             </template>
             <el-button text type="primary" size="small" @click="clearStagedSignalEdits">放弃全部暂存修改</el-button>
           </el-alert>
+          <el-alert
+            v-if="signalGenerationMetadata.status === 'stale'"
+            type="error"
+            :closable="false"
+            show-icon
+            title="正文、截图或工具契约已变化：当前 Signal/Contract 已过期，禁止自动执行；请重新抽取或完成人工复核。"
+          />
+          <div v-if="signalGenerationMetadata.generation_fingerprint" class="section-hint generation-fingerprint">
+            generation={{ signalGenerationMetadata.generation_fingerprint }} · model={{ signalGenerationMetadata.model_id }} · prompt={{ signalGenerationMetadata.prompt_revision }}
+          </div>
+          <el-alert
+            v-if="rejectedSignalCandidates.length > 0"
+            type="warning"
+            :closable="false"
+            show-icon
+            :title="`本轮有 ${rejectedSignalCandidates.length} 条候选未通过工程门禁，已保留原始候选与拒绝原因供复核。`"
+          />
+          <el-collapse v-if="rejectedSignalCandidates.length > 0" class="rejected-candidates">
+            <el-collapse-item
+              v-for="(item, index) in rejectedSignalCandidates"
+              :key="`rejected-${index}`"
+              :title="`拒绝候选 ${index + 1}：${item.reason}`"
+              :name="`rejected-${index}`"
+            >
+              <pre class="code rejected-candidate-json">{{ JSON.stringify(item.candidate, null, 2) }}</pre>
+            </el-collapse-item>
+          </el-collapse>
 
           <!-- 生产者信号（QKV） -->
           <div class="signal-group">
@@ -1866,6 +2131,13 @@ onMounted(() => {
             <div v-for="item in producerSignals" :key="'p-' + item.origIdx" class="signal-card">
               <div class="signal-card-head">
                 <el-tag size="small" type="success">{{ sigTool(item.sig) || 'qkv' }}</el-tag>
+                <el-tag
+                  size="small"
+                  :type="capabilityStatus(sigTool(item.sig)) === 'declared' ? 'info' : 'danger'"
+                  effect="plain"
+                >{{ capabilityStatus(sigTool(item.sig)) === 'declared' ? '契约已声明·运行待探测' : '能力未声明' }}</el-tag>
+                <el-tag size="small" effect="plain">{{ sigRoleLabel(item.sig) }}</el-tag>
+                <el-tag v-if="sigProvenance(item.sig).needs_review" size="small" type="warning">需人工复核</el-tag>
                 <el-tag v-if="hasStagedSignalEdit(item.origIdx)" size="small" type="warning" effect="plain">已暂存</el-tag>
                 <div class="signal-card-actions">
                   <el-button text size="small" @click="goToToolManage(sigTool(item.sig))">工具管理</el-button>
@@ -1881,6 +2153,8 @@ onMounted(() => {
                   <div class="signal-row"><span class="signal-k">说明</span><span class="signal-v">{{ sigArgs(item.sig).instruction || '—' }}</span></div>
                   <div class="signal-row"><span class="signal-k">关键字</span><span class="signal-v">{{ sigArgs(item.sig).keyword || '—' }}</span></div>
                   <div class="signal-row"><span class="signal-k">产出变量</span><span class="signal-v">{{ (sigOrch(item.sig).produces || []).map((p: any) => p.name).join('、') || '—' }}</span></div>
+                  <div class="signal-row"><span class="signal-k">证据来源</span><span class="signal-v code">{{ sigSourceRefs(item.sig).join('、') || sigProvenance(item.sig).source_section || '—' }}</span></div>
+                  <div class="signal-row"><span class="signal-k">证据原文</span><span class="signal-v">{{ sigProvenance(item.sig).evidence || '—' }}</span></div>
                 </div>
                 <div v-else>
                   <div class="signal-row"><span class="signal-k">说明</span><el-input v-model="signalEditDraft.acquire.args.instruction" size="small" type="textarea" :rows="2" placeholder="信号说明，如 镜像文件占用检查" /></div>
@@ -1917,6 +2191,13 @@ onMounted(() => {
             <div v-for="item in consumerSignals" :key="'c-' + item.origIdx" class="signal-card">
               <div class="signal-card-head">
                 <el-tag size="small" type="warning">{{ sigTool(item.sig) || 'qfk' }}</el-tag>
+                <el-tag
+                  size="small"
+                  :type="capabilityStatus(sigTool(item.sig)) === 'declared' ? 'info' : 'danger'"
+                  effect="plain"
+                >{{ capabilityStatus(sigTool(item.sig)) === 'declared' ? '契约已声明·运行待探测' : '能力未声明' }}</el-tag>
+                <el-tag size="small" effect="plain">{{ sigRoleLabel(item.sig) }}</el-tag>
+                <el-tag v-if="sigProvenance(item.sig).needs_review" size="small" type="warning">需人工复核</el-tag>
                 <el-tag v-if="hasStagedSignalEdit(item.origIdx)" size="small" type="warning" effect="plain">已暂存</el-tag>
                 <div class="signal-card-actions">
                   <el-button text size="small" @click="goToToolManage(sigTool(item.sig))">工具管理</el-button>
@@ -1948,6 +2229,8 @@ onMounted(() => {
                   <div class="signal-row"><span class="signal-k">输入变量</span><span class="signal-v code">{{ (sigOrch(item.sig).requires || []).join('、') || '—' }}</span></div>
                   <div class="signal-row"><span class="signal-k">超时时间</span><span class="signal-v">{{ sigArgs(item.sig).timeout || 10 }}s</span></div>
                   <div class="signal-row"><span class="signal-k">执行模式</span><span class="signal-v">{{ qfkOutputMode(item.sig) === 'produces' ? '产出变量（采集命令结果）' : '关键字判定' }}</span></div>
+                  <div class="signal-row"><span class="signal-k">证据来源</span><span class="signal-v code">{{ sigSourceRefs(item.sig).join('、') || sigProvenance(item.sig).source_section || '—' }}</span></div>
+                  <div class="signal-row"><span class="signal-k">证据原文</span><span class="signal-v">{{ sigProvenance(item.sig).evidence || '—' }}</span></div>
                   <template v-if="qfkOutputMode(item.sig) === 'produces'">
                     <div v-for="(p, idx) in (sigOrch(item.sig).produces || [])" :key="`output-${idx}`" class="signal-row">
                       <span class="signal-k">{{ idx === 0 ? '产出变量' : '' }}</span>
@@ -2262,6 +2545,12 @@ onMounted(() => {
                   <span class="screenshot-intro-preview">
                     {{ img.section }}
                   </span>
+                  <el-tag :type="qualityTagType(img.qualityStatus)" size="small" effect="plain">
+                    {{ img.qualityStatus }}<template v-if="img.needsReview"> · 需复核</template>
+                  </el-tag>
+                  <el-tag v-if="img.inferenceNeedsReview" type="warning" size="small" effect="plain">
+                    语义推断 {{ img.inferenceStatus }}
+                  </el-tag>
                   <el-button
                     type="warning"
                     size="small"
@@ -2306,6 +2595,43 @@ onMounted(() => {
                     <div class="ss-field-label">语义描述</div>
                     <p v-if="img.description" class="ss-description">{{ img.description }}</p>
                     <span v-else class="ss-empty">无</span>
+                  </div>
+                  <!-- 5. 文档上下文：证明图片位于哪个排障步骤，不把上下文当 OCR 事实 -->
+                  <div class="ss-field evidence-context">
+                    <div class="ss-field-label">文档上下文（非截图 OCR）</div>
+                    <div><strong>前文：</strong>{{ img.contextBefore || '—' }}</div>
+                    <div><strong>后文：</strong>{{ img.contextAfter || '—' }}</div>
+                  </div>
+                  <!-- 6. Evidence IR：观察事实与模型推测必须分栏展示 -->
+                  <div class="ss-field">
+                    <div class="ss-field-label">Observed Facts（可作为信号事实）</div>
+                    <ul v-if="img.observedFacts.length" class="ss-field-list evidence-facts">
+                      <li v-for="(fact, j) in img.observedFacts" :key="`fact-${j}`">{{ fact }}</li>
+                    </ul>
+                    <span v-else class="ss-empty">无；不得据此生成事实型信号</span>
+                  </div>
+                  <div class="ss-field evidence-inferences">
+                    <div class="ss-field-label">
+                      Inferences（模型推测，不得独立生成运行参数）
+                      <el-tag v-if="img.inferenceNeedsReview" type="warning" size="small" effect="plain">
+                        {{ img.inferenceStatus }}
+                      </el-tag>
+                    </div>
+                    <ul v-if="img.inferences.length" class="ss-field-list">
+                      <li v-for="(inference, j) in img.inferences" :key="`inference-${j}`">{{ inference }}</li>
+                    </ul>
+                    <span v-else class="ss-empty">无</span>
+                    <div v-if="img.inferenceIssues.length" class="ss-empty">
+                      风险码：{{ img.inferenceIssues.join(', ') }}
+                    </div>
+                  </div>
+                  <div class="ss-field evidence-provenance">
+                    <div class="ss-field-label">Provenance</div>
+                    <div>image_sha256：<code>{{ img.provenance.image_sha256 || '—' }}</code></div>
+                    <div>vision_model：<code>{{ img.provenance.vision_model || '—' }}</code></div>
+                    <div>prompt_revision：<code>{{ img.provenance.prompt_revision || '—' }}</code></div>
+                    <div>transform：<code>{{ img.provenance.transform || '—' }}</code></div>
+                    <div v-if="Array.isArray(img.provenance.transforms)">source tiles：<code>{{ JSON.stringify(img.provenance.transforms) }}</code></div>
                   </div>
                 </div>
               </div>
@@ -2630,6 +2956,11 @@ onMounted(() => {
   align-items: center;
   gap: 8px;
 }
+.generation-fingerprint {
+  margin: 8px 0;
+  font-family: monospace;
+  overflow-wrap: anywhere;
+}
 
 /* 图片列表容器（images_json 渲染） */
 .images-json-container {
@@ -2713,6 +3044,30 @@ onMounted(() => {
   font-size: 13px;
   color: #606266;
   line-height: 1.7;
+}
+.evidence-context,
+.evidence-provenance {
+  padding: 8px 10px;
+  border-radius: 4px;
+  background: #f5f7fa;
+  color: #606266;
+  font-size: 12px;
+  line-height: 1.7;
+  overflow-wrap: anywhere;
+}
+.evidence-facts {
+  border-left: 3px solid #67c23a;
+  padding-left: 18px;
+}
+.evidence-inferences {
+  padding: 8px 10px;
+  border: 1px solid #f3d19e;
+  border-radius: 4px;
+  background: #fdf6ec;
+}
+.evidence-provenance code {
+  font-size: 11px;
+  word-break: break-all;
 }
 .ss-empty {
   font-size: 13px;
