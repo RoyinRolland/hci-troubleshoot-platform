@@ -21,6 +21,7 @@ import copy
 import json
 import os
 import re
+import shlex
 from typing import TYPE_CHECKING, Any
 
 from fastapi import APIRouter, HTTPException, Request, status
@@ -54,6 +55,11 @@ from app.services.safe_pipeline_converter import (
     convert_safe_pipeline,
 )
 from app.services.signal_job_manager import get_signal_job_manager
+from app.services.sop_tool_contract_validator import (
+    get_acli_catalog_commands,
+    validate_acli_catalog_command,
+    validate_acli_invocation_command,
+)
 
 if TYPE_CHECKING:
     from shared.database.postgres import DatabaseManager
@@ -125,13 +131,28 @@ DEFAULT_VARIABLE_SCHEMA: list[str] = [
 ]
 
 VALID_CATEGORIES = {"frontend", "backend"}
+_LOG_EVIDENCE_RE = re.compile(
+    r"(?:日志|\blog\b|\bkernel\b|\b(?:err|error|warn|warning|info|debug|critical)\b|"
+    r"\b20\d{2}[-/]\d{1,2}[-/]\d{1,2}[ T]\d{1,2}:\d{2})",
+    re.IGNORECASE,
+)
+_EXTERNAL_BMC_EVENT_RE = re.compile(
+    r"(?:\b(?:i?BMC)\b.{0,80}(?:event|日志|restarted)|restarted\s+by\s+(?:i?BMC))",
+    re.IGNORECASE,
+)
+_CONFIG_FILE_EXTENSION_RE = re.compile(r"\.(?:cfg|conf|ini|json|ya?ml)$", re.IGNORECASE)
 VALID_MATCHER_TYPES = {"keyword", "regex", "state", "threshold", "delta", "trend", "exists"}
 VALID_VARIABLE_TYPES = {"string", "integer", "number", "boolean", "array"}
+REJECT_REASON_CODES = frozenset({"write_signal", "not_exists", "run_failed"})
 
 # ADR-2：{{VAR}} 大写占位符正则（单一真相源；运行期校验用）
 _PLACEHOLDER_RE = re.compile(r"\{\{([A-Z][A-Z0-9_]*(?:\.[A-Z0-9_]+)*)\}\}")
 # 用于检测"任何双花括号占位符"（含非法大小写）以报错
 _ANY_PLACEHOLDER_RE = re.compile(r"\{\{([^}]*)\}\}")
+_REDACTED_MATCHER_RE = re.compile(
+    r"(?:\*{2,}|%(?:\([^)]+\))?[a-z]|(?<![A-Za-z0-9])x{2,}(?=[^A-Za-z0-9]|$))",
+    re.IGNORECASE,
+)
 
 # 字段级溯源：抽取方法标识（写入每条信号的 provenance.method）
 EXTRACTION_METHOD = "llm_field_level_v2"
@@ -397,7 +418,9 @@ def _enrich_signal(
     else:
         # 人工确认是执行授权策略，不等价于处置动作；只读诊断即使需要确认，
         # 仍保留在诊断证据图中。
-        orchestrate["phase"] = orchestrate.get("phase", "diagnostic")
+        orchestrate["phase"] = (
+            orchestrate.get("phase", "diagnostic") if allow_solution_signals else "diagnostic"
+        )
         review.setdefault("require_human_confirm", False)
         provenance["risk"] = provenance.get(
             "risk", 2 if review.get("require_human_confirm") else 1
@@ -475,9 +498,27 @@ def _validate_signal(
     if cat not in VALID_CATEGORIES:
         return False, f"provenance.category 非法: {cat}"
 
+    evidence = str(prov.get("evidence") or "").strip()
+    if tool == "qkv_alert" and _EXTERNAL_BMC_EVENT_RE.search(evidence):
+        return False, "BMC/iBMC 外部事件日志不是 HCI 平台告警，不能由 qkv_alert 获取"
+    if tool == "qfk_log":
+        file_name = str(args.get("file") or "").strip()
+        path = str(args.get("path") or "").strip()
+        if _CONFIG_FILE_EXTENSION_RE.search(file_name):
+            return False, f"qfk_log 只能采集日志，不能把配置文件 {file_name} 作为日志执行"
+        has_explicit_source = bool(
+            (file_name and file_name.casefold() in evidence.casefold())
+            or (path and path.casefold() in evidence.casefold())
+        )
+        if not has_explicit_source and not _LOG_EVIDENCE_RE.search(evidence):
+            return False, "qfk_log 缺少可追溯的日志文件/路径或日志形态 evidence，采集来源无法验证"
+
     # KBD 处置动作必须先于 match/produces 结构校验拒绝，确保专家看到真正原因。
     if enforce_kbd_read_only:
-        read_only_violation = kbd_signal_read_only_violation(signal)
+        read_only_violation = kbd_signal_read_only_violation(
+            signal,
+            allow_read_only_solution_correction=True,
+        )
         if read_only_violation:
             return False, read_only_violation
 
@@ -510,7 +551,125 @@ def _validate_signal(
             return False, "backend 信号必须且只能配置 match 或 orchestrate.produces 之一"
         if has_match and matcher.get("type") not in VALID_MATCHER_TYPES:
             return False, f"backend 信号 match.type 非法: {matcher.get('type')}"
+        if has_match:
+            matcher_violation = _matcher_quality_violation(
+                matcher,
+                evidence=str(prov.get("evidence") or ""),
+            )
+            if matcher_violation:
+                return False, matcher_violation
     return True, None
+
+
+def _qfk_catalog_violation(tool: str, args: dict[str, Any]) -> str | None:
+    """把 Proposal 编译为运行时同形命令，并以 aCLI catalog 做存在性门禁。"""
+
+    if tool == "qfk_system":
+        command = str(args.get("command") or "").strip()
+        command_args = args.get("command_args") or []
+        # /sf/cfg 配置读取由本模块确定性地从 qfk_log 归一成 system cat；这是现有
+        # KBD 只读契约，不应被设备 Catalog 的采集缺口反向拒绝。
+        if command == "cat":
+            return None
+        compiled = shlex.join(["acli", "system", command, *command_args])
+    elif tool in {"qfk_vm", "qfk_network", "qfk_storage", "qfk_hardware", "qfk_platform"}:
+        namespace = tool.removeprefix("qfk_")
+        command = str(args.get("command") or "").strip()
+        compiled = f"acli {namespace} {command}"
+    else:
+        # qfk_log 和 qfk_service 使用专用 Handler；其结构/语义已由 acquire args 门禁覆盖。
+        return None
+
+    reason = validate_acli_catalog_command(compiled)
+    return f"关键信号命令不可执行: {reason}" if reason else None
+
+
+def _qfk_invocation_violation(tool: str, args: dict[str, Any]) -> str | None:
+    """校验已登记命令的最小 argv；失败属于 run_failed 而非 not_exists。"""
+
+    if tool != "qfk_system":
+        return None
+    command = str(args.get("command") or "").strip()
+    command_args = args.get("command_args") or []
+    compiled = shlex.join(["acli", "system", command, *command_args])
+    reason = validate_acli_invocation_command(compiled)
+    return f"关键信号验证执行不通过: {reason}" if reason else None
+
+
+def _qfk_command_capability_violation(signal: dict[str, Any]) -> str | None:
+    """校验命令固有能力能否采集 Candidate 声称的目标事实。"""
+
+    acquire = signal.get("acquire") or {}
+    if acquire.get("tool") != "qfk_system":
+        return None
+    args = acquire.get("args") or {}
+    command = str(args.get("command") or "").strip()
+    command_args = args.get("command_args") or []
+    if command != "ipmitool" or command_args[:2] != ["mc", "info"]:
+        return None
+    evidence = str((signal.get("provenance") or {}).get("evidence") or "")
+    instruction = str(args.get("instruction") or "")
+    if re.search(r"(?:RAID|适配器|阵列卡|磁盘控制器)", f"{instruction}\n{evidence}", re.IGNORECASE):
+        return (
+            "ipmitool mc info 只能采集 BMC/MC 信息，不能采集 RAID/适配器固件；"
+            "命令能力与 Candidate 目标事实不一致"
+        )
+    return None
+
+
+def _acquirer_catalog_prompt_text() -> str:
+    """同时给模型工具语义和当前 catalog 事实，知识只用于减少乱造，不代替门禁。"""
+
+    tools = [f"- {name}: {description}" for name, description in ACQUIRER_CATALOG.items()]
+    commands = [f"- {command}" for command in sorted(get_acli_catalog_commands())]
+    return "\n".join(
+        [
+            *tools,
+            "",
+            "当前内置 aCLI catalog（生成时优先采用；缺失时仍须输出 Candidate，由服务端分流）：",
+            *commands,
+        ]
+    )
+
+
+def _matcher_quality_violation(matcher: dict[str, Any], *, evidence: str = "") -> str | None:
+    """拒绝结构合法但运行时会静默误判的 Matcher。"""
+
+    matcher_type = str(matcher.get("type") or "")
+    pattern = matcher.get("pattern")
+    patterns = pattern if isinstance(pattern, list) else [pattern]
+    text_patterns = [str(item) for item in patterns if item is not None]
+
+    redacted = next((item for item in text_patterns if _REDACTED_MATCHER_RE.search(item)), None)
+    if redacted:
+        return f"match.pattern 包含脱敏占位文本，无法在现场可靠命中: {redacted}"
+    if matcher_type == "exists" and any(item.strip() for item in text_patterns):
+        return "exists Matcher 不读取 match.pattern；如需匹配具体内容请使用 keyword/regex/state"
+    if matcher_type == "keyword" and any(re.search(r"\S\|\S", item) for item in text_patterns):
+        return "keyword Matcher 不解释正则竖线；多关键字请使用 pattern 数组，正则语义请使用 regex"
+    if matcher_type == "keyword" and text_patterns and evidence.strip():
+        untraceable_patterns = [
+            item
+            for item in text_patterns
+            if not _PLACEHOLDER_RE.search(item) and item.casefold() not in evidence.casefold()
+        ]
+        if untraceable_patterns:
+            return (
+                "keyword Matcher 的 match.pattern 无法从 provenance.evidence 逐字追溯；"
+                f"禁止改写或混入无证据的通用关键词: {untraceable_patterns[0]}"
+            )
+    if matcher_type == "regex" and text_patterns and evidence.strip():
+        for regex_pattern in text_patterns:
+            try:
+                matched = re.search(regex_pattern, evidence) is not None
+            except re.error as exc:
+                return f"regex Matcher 无法编译: {exc}"
+            if not matched:
+                return (
+                    "regex Matcher 的 match.pattern 无法命中 provenance.evidence，"
+                    f"现场执行前已验证失败: {regex_pattern}"
+                )
+    return None
 
 
 def _validate_obj_placeholders(obj: Any) -> None:
@@ -776,6 +935,21 @@ def _validate_and_collect_signals(
         raw_signals: LLM 返回的 signal dict 列表
         source_id: 来源标识（用于日志：kbd_id / sop_id）
     """
+    # Rejected Candidate 必须保留 LLM 原始对象；规范化和 enrich 只作用于工作副本。
+    original_candidates = {id(item): copy.deepcopy(item) for item in raw_signals}
+    read_only_violations = {
+        id(item): violation
+        for item in raw_signals
+        if enforce_kbd_read_only
+        and (
+            violation := kbd_signal_read_only_violation(
+                item,
+                allow_read_only_solution_correction=True,
+            )
+        )
+        is not None
+    }
+
     # 先在整个 Candidate 集合上做跨信号规范化，再逐条校验。这使下游
     # matcher 可以复用上游安全采集，也避免放宽 qfk_log 的 path 边界。
     for signal in raw_signals:
@@ -795,6 +969,16 @@ def _validate_and_collect_signals(
 
     validated: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
+
+    def reject(candidate: Any, reason_code: str, reason: str) -> None:
+        """以稳定三分类完整保留坏候选，禁止静默丢弃。"""
+
+        if reason_code not in REJECT_REASON_CODES:  # pragma: no cover - 内部编程错误防御
+            raise ValueError(f"未知 Candidate 拒绝码: {reason_code}")
+        original = original_candidates.get(id(candidate), copy.deepcopy(candidate))
+        rejected.append(
+            {"signal": original, "reason_code": reason_code, "reason": reason}
+        )
     preparation_errors: dict[int, str] = {}
     for s in raw_signals:
         if not isinstance(s, dict) or "acquire" not in s:
@@ -808,35 +992,64 @@ def _validate_and_collect_signals(
 
     for s in raw_signals:
         if not isinstance(s, dict):
-            rejected.append({"signal": s, "reason": "信号非对象"})
+            reject(s, "run_failed", "Candidate 非对象，无法执行结构校验")
             continue
         if "acquire" not in s:
-            rejected.append({"signal": s, "reason": "信号缺少 acquire 段（v1 扁平格式已不再支持）"})
+            reject(s, "run_failed", "Candidate 缺少 acquire 段（v1 扁平格式已不再支持）")
             continue
-        if enforce_kbd_read_only:
-            read_only_violation = kbd_signal_read_only_violation(s)
-            if read_only_violation:
-                s.setdefault("provenance", {})["needs_review"] = True
-                s.setdefault("review", {})["notes"] = read_only_violation
-                rejected.append({"signal": s, "reason": read_only_violation})
+        if id(s) in read_only_violations:
+            read_only_violation = read_only_violations[id(s)]
+            reject(s, "write_signal", read_only_violation)
+            logger.warning(
+                "extract_signals 拒绝 KBD 处置动作 source=%s reason=%s",
+                source_id,
+                read_only_violation,
+            )
+            continue
+        acquire = s.get("acquire") or {}
+        tool = str(acquire.get("tool") or "")
+        args = acquire.get("args") or {}
+        args_ok, _ = (
+            validate_acquire_args(tool, args)
+            if tool in ACQUIRER_CATALOG
+            else (False, None)
+        )
+        if args_ok:
+            catalog_violation = _qfk_catalog_violation(tool, args)
+            if catalog_violation:
+                reject(s, "not_exists", catalog_violation)
                 logger.warning(
-                    "extract_signals 拒绝 KBD 处置动作 source=%s reason=%s",
+                    "extract_signals 拒绝 catalog 缺失命令 source=%s reason=%s",
                     source_id,
-                    read_only_violation,
+                    catalog_violation,
+                )
+                continue
+            invocation_violation = _qfk_invocation_violation(tool, args)
+            if invocation_violation:
+                reject(s, "run_failed", invocation_violation)
+                logger.warning(
+                    "extract_signals 拒绝无法运行的命令调用 source=%s reason=%s",
+                    source_id,
+                    invocation_violation,
+                )
+                continue
+            capability_violation = _qfk_command_capability_violation(s)
+            if capability_violation:
+                reject(s, "run_failed", capability_violation)
+                logger.warning(
+                    "extract_signals 拒绝命令能力错配 source=%s reason=%s",
+                    source_id,
+                    capability_violation,
                 )
                 continue
         if id(s) in preparation_errors:
             reason = preparation_errors[id(s)]
-            s.setdefault("provenance", {})["needs_review"] = True
-            s.setdefault("review", {})["notes"] = reason
-            rejected.append({"signal": s, "reason": reason})
+            reject(s, "run_failed", reason)
             logger.warning("extract_signals 安全管道转换失败 source=%s reason=%s", source_id, reason)
             continue
         if id(s) in unconsumed_producers:
             reason = unconsumed_producers[id(s)]
-            s.setdefault("provenance", {})["needs_review"] = True
-            s.setdefault("review", {})["notes"] = reason
-            rejected.append({"signal": s, "reason": reason})
+            reject(s, "run_failed", reason)
             logger.warning("extract_signals 拒绝未消费 QFK producer source=%s reason=%s", source_id, reason)
             continue
         ok, err = _validate_signal(
@@ -853,13 +1066,50 @@ def _validate_and_collect_signals(
             try:
                 validate_signals_json({"schema_version": 2, "signals": [enriched]})
             except ValidationError as exc:
-                rejected.append({"signal": enriched, "reason": f"v2 契约校验失败: {exc.message}"})
+                reject(enriched, "run_failed", f"v2 契约校验失败: {exc.message}")
                 logger.warning("extract_signals 信号被契约拒绝 source=%s reason=%s", source_id, exc.message)
                 continue
             validated.append(enriched)
         else:
-            rejected.append({"signal": s, "reason": err})
+            reject(s, "run_failed", str(err or "Candidate 未通过执行校验"))
             logger.warning("extract_signals 信号被丢弃 source=%s reason=%s", source_id, err)
+
+    # 只允许依赖“最终能成为 Signal”的 producer。若 producer 已因 write/catalog/结构
+    # 问题被拒，consumer 不能借原始 Candidate 集合中的幽灵变量误过门禁。
+    reachable_variables = set(DEFAULT_VARIABLE_SCHEMA) | set(external_variables or set())
+    remaining = list(validated)
+    reachable_ids: set[int] = set()
+    while remaining:
+        ready = [
+            signal
+            for signal in remaining
+            if set((signal.get("orchestrate") or {}).get("requires") or []).issubset(
+                reachable_variables
+            )
+        ]
+        if not ready:
+            break
+        for signal in ready:
+            reachable_ids.add(id(signal))
+            reachable_variables.update(
+                str(item.get("name"))
+                for item in ((signal.get("orchestrate") or {}).get("produces") or [])
+                if isinstance(item, dict) and item.get("name")
+            )
+            remaining.remove(signal)
+    if remaining:
+        validated = [signal for signal in validated if id(signal) in reachable_ids]
+        for signal in remaining:
+            requires = sorted(
+                set((signal.get("orchestrate") or {}).get("requires") or [])
+                - reachable_variables
+            )
+            reject(
+                signal,
+                "run_failed",
+                "变量依赖不可达，所需 producer 未通过门禁或依赖成环: "
+                + ", ".join(requires),
+            )
 
     return validated, rejected
 
@@ -913,16 +1163,23 @@ def _build_verification_contract(
                 assigned.add(signal_id)
     if not normalized["must"]:
         # 自动诊断没有必要证据就不能确认；选择首个非 solution 信号作为保守 must。
-        fallback = next(
+        fallback_signal = next(
             (
-                str(signal.get("id"))
+                signal
                 for signal in signals
-                if signal.get("id") and str(signal.get("id")) not in normalized["context"]
+                if signal.get("id")
+                and str((signal.get("orchestrate") or {}).get("phase") or "diagnostic")
+                != "solution"
             ),
             None,
         )
-        if fallback:
-            for role in ("should", "exclude"):
+        if fallback_signal:
+            fallback = str(fallback_signal["id"])
+            # reconcile_verification_contract 以 signals[].role 为唯一事实源，因此
+            # 不能只修改投影数组；必须同步提升 Signal 角色，避免最终 canonical
+            # 又把它放回 context 并产生空 must。
+            fallback_signal["role"] = "must"
+            for role in ("should", "exclude", "context"):
                 if fallback in normalized[role]:
                     normalized[role].remove(fallback)
             normalized["must"].append(fallback)
@@ -990,13 +1247,16 @@ def _signals_to_v2(
     """
     doc: dict[str, Any] = {"schema_version": 2, "signals": signals}
     if rejected_candidates:
-        doc["rejected_candidates"] = [
-            {
+        doc["rejected_candidates"] = []
+        for item in rejected_candidates:
+            rejected = {
                 "candidate": item.get("signal"),
                 "reason": str(item.get("reason") or "未提供拒绝原因"),
             }
-            for item in rejected_candidates
-        ]
+            reason_code = item.get("reason_code")
+            if reason_code in REJECT_REASON_CODES:
+                rejected["reason_code"] = reason_code
+            doc["rejected_candidates"].append(rejected)
     if verification_contract is not None:
         doc["verification_contract"] = verification_contract
     if generation_metadata is not None:
@@ -1115,7 +1375,7 @@ async def extract_signals_for_kbd(db_manager: DatabaseManager, kbd_id: int) -> d
             consumer="kb-service.extract_signals.kbd",
         )
 
-    acquirer_catalog_text = "\n".join(f"- {k}: {v}" for k, v in ACQUIRER_CATALOG.items())
+    acquirer_catalog_text = _acquirer_catalog_prompt_text()
     variable_schema_text = ", ".join(DEFAULT_VARIABLE_SCHEMA)
     image_evidence_text = _format_image_evidence(entry_data["images_json"])
     prompt = prompt_template.format(
@@ -1133,9 +1393,11 @@ async def extract_signals_for_kbd(db_manager: DatabaseManager, kbd_id: int) -> d
     )
 
     llm_result = await _call_llm(prompt)
-    raw_signals = llm_result.get("signals", [])
+    raw_signals = llm_result.get("candidates")
+    if raw_signals is None:
+        raw_signals = llm_result.get("signals", [])
     if not isinstance(raw_signals, list):
-        raise HTTPException(status_code=500, detail="LLM 未返回 signals 数组")
+        raise HTTPException(status_code=500, detail="LLM 未返回 Candidate 数组（candidates/signals）")
     proposed_contract = llm_result.get("verification_contract")
     external_variables = set(_normalize_contract_variables(proposed_contract))
     validated, rejected = _validate_and_collect_signals(
@@ -1233,7 +1495,7 @@ async def extract_signals_for_sop(db_manager: DatabaseManager, sop_id: int) -> d
             consumer="kb-service.extract_signals.sop",
         )
 
-    acquirer_catalog_text = "\n".join(f"- {k}: {v}" for k, v in ACQUIRER_CATALOG.items())
+    acquirer_catalog_text = _acquirer_catalog_prompt_text()
     variable_schema_text = ", ".join(merged_vars)
     # SOP 复用同一 Prompt：以 tree_json 当作 steps_text 输入
     prompt = prompt_template.format(
@@ -1250,9 +1512,11 @@ async def extract_signals_for_sop(db_manager: DatabaseManager, sop_id: int) -> d
     )
 
     llm_result = await _call_llm(prompt)
-    raw_signals = llm_result.get("signals", [])
+    raw_signals = llm_result.get("candidates")
+    if raw_signals is None:
+        raw_signals = llm_result.get("signals", [])
     if not isinstance(raw_signals, list):
-        raise HTTPException(status_code=500, detail="LLM 未返回 signals 数组")
+        raise HTTPException(status_code=500, detail="LLM 未返回 Candidate 数组（candidates/signals）")
     validated, rejected = _validate_and_collect_signals(raw_signals, f"sop:{sop_id}")
 
     # SOP 执行由 tree_json 决策树拥有裁决契约，不生成 KBD Case Verification Contract。
@@ -1284,6 +1548,7 @@ class ExtractSignalsResponse(BaseModel):
     success: bool
     kbd_id: int | None = None
     sop_id: int | None = None
+    proposal_revision_id: int | None = None
     signals_count: int
     rejected_count: int = 0
     signals: list[dict[str, Any]] = Field(default_factory=list)
