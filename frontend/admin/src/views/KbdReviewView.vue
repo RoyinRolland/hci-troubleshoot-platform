@@ -1069,6 +1069,21 @@ function normalizeOptionalMatcherNulls(signal: SignalV2): SignalV2 {
   return normalized
 }
 
+function normalizeQfkProduceExtracts(signal: SignalV2): SignalV2 {
+  const normalized = cloneSignal(signal)
+  if (!sigTool(normalized).startsWith('qfk')) return normalized
+  const produces = normalized.orchestrate?.produces
+  if (!Array.isArray(produces)) return normalized
+  for (const produce of produces) {
+    if (produce && typeof produce === 'object' && produce.extract && typeof produce.extract === 'object') {
+      // QFK 使用声明式 extract；顶层 path 是旧 QKV JSON path 字段。两者并存即使
+      // path 为空也违反 Schema，保存前收敛，避免专家看不见的历史草稿字段造成 422。
+      delete produce.path
+    }
+  }
+  return normalized
+}
+
 function markLocalSignal(signalId: string): void {
   localSignalIds.value = new Set([...localSignalIds.value, signalId])
 }
@@ -1113,7 +1128,7 @@ function reconcileSignalContract(currentDoc: SignalsDoc, list: SignalV2[]): Sign
   ) as Record<string, SignalV2['role']>
   const policy: Record<string, string[]> = Object.fromEntries(evidenceRoles.map((role) => [role, []]))
   payload.signals = list.map((raw) => {
-    const signal = cloneSignal(raw)
+    const signal = normalizeQfkProduceExtracts(raw)
     const id = String(signal.id || '')
     const role = evidenceRoles.includes(signal.role as typeof evidenceRoles[number])
       ? signal.role!
@@ -1575,7 +1590,13 @@ function setQfkOutputMode(mode: 'keyword' | 'produces') {
     // 输出采集不做匹配判定，命令成功后把 stdout/JSON 路径结果写入变量池。
     draft.match = null
     if (!Array.isArray(draft.orchestrate.produces) || draft.orchestrate.produces.length === 0) {
-      draft.orchestrate.produces = [{ name: '', type: 'string', path: '' }]
+      draft.orchestrate.produces = [{
+        name: '',
+        type: 'string',
+        extract: {
+          type: 'text', rows: { mode: 'all' }, cardinality: 'exactly_one', source: 'stdout', value_mode: 'string',
+        },
+      }]
     }
     return
   }
@@ -3188,7 +3209,7 @@ onMounted(() => {
                   <div class="signal-row"><span class="signal-k">说明</span><el-input v-model="signalEditDraft.acquire.args.instruction" size="small" type="textarea" :rows="2" placeholder="信号说明，如 镜像文件占用检查" /></div>
                   <div class="field-hint">信号语义说明：用自然语言描述这个采集做什么（如「镜像文件占用检查」），是人类可读标题，不是匹配条件</div>
                   <div class="signal-row"><span class="signal-k">证据作用</span><el-select v-model="signalEditDraft.role" size="small"><el-option label="必要证据（必须满足）" value="must" /><el-option label="增强证据（按门槛满足）" value="should" /><el-option label="排除证据（出现即排除）" value="exclude" /><el-option label="上下文证据（执行但不参与结论）" value="context" /></el-select></div>
-                  <div class="signal-row"><span class="signal-k">采集类型</span><el-select :model-value="sigTool(signalEditDraft)" size="small" @change="onSignalToolChange"><el-option label="任务 qkv_task" value="qkv_task" /><el-option label="告警 qkv_alert" value="qkv_alert" /><el-option label="纯弹框 qkv_dialog" value="qkv_dialog" /></el-select><span class="signal-nature">{{ qkvNatureLabel(sigTool(signalEditDraft)) }}</span></div>
+                  <div class="signal-row"><span class="signal-k">采集类型</span><el-select :model-value="sigTool(signalEditDraft)" size="small" @change="onSignalToolChange"><el-option label="任务 qkv_task" value="qkv_task" /><el-option label="告警 qkv_alert" value="qkv_alert" /><el-option label="弹框 qkv_dialog" value="qkv_dialog" /></el-select><span class="signal-nature">{{ qkvNatureLabel(sigTool(signalEditDraft)) }}</span></div>
                   <div class="signal-row"><span class="signal-k">关键字</span><el-input v-model="signalEditDraft.acquire.args.keyword" size="small" :placeholder="qkvKeywordPlaceholder(sigTool(signalEditDraft))" /></div>
                   <div v-if="sigTool(signalEditDraft) === 'qkv_alert'" class="field-hint">告警型关键字（acli alert get -k）：取自「分类基线 · 告警型故障」（标签以「告警」结尾），如 虚拟机CPU或内存占用过高告警、主机网口丢包告警、序列号过期告警。多个用逗号分隔</div>
                   <div v-else-if="sigTool(signalEditDraft) === 'qkv_task'" class="field-hint">任务失败型关键字（acli task get -k）：取自「分类基线 · 任务失败型故障」，如 虚拟机开机失败、虚拟机快照失败、虚拟机scmt迁移失败。多个用逗号分隔</div>
