@@ -2,6 +2,7 @@
 
 import asyncio
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from app.routes import extract_signals
@@ -21,6 +22,7 @@ from app.routes.extract_signals import (
     _validate_and_collect_signals,
 )
 from jsonschema import ValidationError
+from shared.resolution.review import SignalReviewFeature
 from shared.schemas.kbd_signal_safety import (
     signal_write_operation_command,
     validate_kbd_read_only_signals_json,
@@ -149,6 +151,28 @@ def test_kbd_candidate_gate_uses_three_stable_reason_codes_and_keeps_good_signal
     assert "缺少运行所需参数" in rejected[-1]["reason"]
     assert rejected[0]["signal"]["orchestrate"]["phase"] == "solution"
     assert "provenance" not in rejected[0]["signal"]
+
+
+def test_llm_candidate_gate_delegates_to_shared_signal_review():
+    candidate = {
+        "id": "runtime-blocked",
+        "acquire": {"tool": "qkv_task", "args": {"keyword": "启动虚拟机"}},
+        "match": None,
+        "orchestrate": {"phase": "diagnostic", "produces": [{"name": "TASK", "path": "task"}], "requires": []},
+    }
+    runtime_issue = SimpleNamespace(message="Shared Runtime test block")
+    blocked_review = SimpleNamespace(blocked=True, issues=[runtime_issue])
+
+    with patch.object(extract_signals, "review_signal_document", return_value=blocked_review) as review:
+        accepted, rejected = _validate_and_collect_signals(
+            [candidate], "kbd:test", enforce_kbd_read_only=True
+        )
+
+    assert accepted == []
+    assert rejected[0]["reason_code"] == "run_failed"
+    assert rejected[0]["reason"] == "Shared Runtime test block"
+    review.assert_called_once()
+    assert review.call_args.kwargs["feature"] is SignalReviewFeature.LLM_GENERATION
 
 
 def test_post_remediation_read_only_check_is_not_misclassified_as_write_signal():
