@@ -1,30 +1,15 @@
 """
 data-pipeline/kbd/run.py — KBD 知识生产管道 CLI 入口（API 调用版）
 
-使用方式（在项目根目录下）：
+统一任务入口（在项目根目录下）：
 
-  # 完整流水线（从 Excel 读取所有 ID）
-  uv run python -m data-pipeline.kbd.run pipeline --excel
+  uv run python -m data-pipeline.kbd.run task --ids 34977 --stages all
+  uv run python -m data-pipeline.kbd.run cli
+  uv run python -m data-pipeline.kbd.run task --excel --stages vision --resume
+  uv run python -m data-pipeline.kbd.run task --run-id 20260809_103000 --failed
 
-  # 完整流水线（指定 ID 列表）
-  uv run python -m data-pipeline.kbd.run pipeline --ids 34977,36179,36166
-
-  # 只跑特定 Stage
-  uv run python -m data-pipeline.kbd.run fetch --excel --limit 100
-  uv run python -m data-pipeline.kbd.run import --excel
-  uv run python -m data-pipeline.kbd.run vision --ids 34977,36179
-  uv run python -m data-pipeline.kbd.run classify --excel
-  uv run python -m data-pipeline.kbd.run extract-signals --excel
-  uv run python -m data-pipeline.kbd.run review-signals --all
-
-  # 从上次中断处继续（断点续传）
-  uv run python -m data-pipeline.kbd.run pipeline --excel --resume
-
-  # 仅处理失败的案例
-  uv run python -m data-pipeline.kbd.run vision --excel --failed-only
-
-  # 强制重新处理（覆盖已完成的记录）
-  uv run python -m data-pipeline.kbd.run pipeline --excel --force-fetch --override
+无模式参数执行未完成和失败任务；`--resume` 仅未完成，`--failed` 仅失败，
+`--rework[=draft,published]` 重做指定生命周期状态。三者严格互斥。
 
   # SOP 文档导入
   uv run python -m data-pipeline.kbd.import_sop --file /path/to/sop.docx --category-id "虚拟机-001"
@@ -51,7 +36,25 @@ from .config import settings
 from .fetcher import read_ids_from_excel
 from .observability import install_trace_logging, new_trace_id, set_trace_id
 from .pipeline import EMPTY_SIGNALS_JSON_PREDICATE, Stage, run_from_excel
+from .progress import load_progress
 from .runtime import require_shared_contracts
+from .task_manager import (
+    ALL_STAGE_NAMES,
+    REWORK_STATUS_NAMES,
+    TaskMode,
+    parse_rework_statuses,
+    parse_stage_names,
+    parse_task_mode,
+    select_task_ids,
+    stage_cli_name,
+)
+from .task_state import (
+    load_execution_manifest,
+    load_state,
+    merge_run_progress,
+    save_execution_manifest,
+    save_state,
+)
 from .terminal_layout import SUMMARY_COLUMN_WIDTHS, TERMINAL_LAYOUT_WIDTH
 
 # ─── 日志配置（终端 + 文件双输出）────────────────────────────────────────────────
@@ -295,6 +298,135 @@ def _get_kbd_ids(args: argparse.Namespace) -> list[str]:
         sys.exit(1)
 
 
+def _get_task_ids(args: argparse.Namespace) -> list[str]:
+    """解析统一任务范围；``--run-id`` 从历史任务 manifest 读取 ID。"""
+
+    limit = getattr(args, "limit", None)
+    if limit is not None and limit <= 0:
+        raise ValueError("--limit 必须是正整数")
+    if getattr(args, "run_id", None):
+        manifest = load_execution_manifest(args.run_id)
+        if manifest is None:
+            raise ValueError(f"任务 run_id 不存在或没有不可变 manifest: {args.run_id}")
+        ids = [str(value) for value in manifest.get("requested_ids", [])]
+        return ids[:limit] if limit is not None else ids
+    if getattr(args, "excel", False):
+        excel_file = getattr(args, "excel_file", None)
+        ids = read_ids_from_excel(Path(excel_file)) if excel_file else read_ids_from_excel()
+    elif getattr(args, "ids", None):
+        raw_ids = [item.strip() for item in args.ids.split(",") if item.strip()]
+        invalid = [item for item in raw_ids if not item.isdigit()]
+        if invalid:
+            raise ValueError(f"案例 ID 必须是数字: {', '.join(invalid)}")
+        ids = raw_ids
+    elif getattr(args, "id_file", None):
+        path = Path(args.id_file)
+        ids = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        invalid = [item for item in ids if not item.isdigit()]
+        if invalid:
+            raise ValueError(f"ID 文件包含非法案例 ID: {', '.join(invalid)}")
+    else:
+        raise ValueError("需要提供 --ids、--excel、--id-file 或 --run-id 之一")
+    # 保持输入顺序并去重，避免同一任务在一次运行中被重复调度。
+    unique_ids = list(dict.fromkeys(ids))
+    return unique_ids[:limit] if limit is not None else unique_ids
+
+
+def _build_task_plan(args: argparse.Namespace) -> tuple[TaskMode, tuple[str, ...], list[str], dict[Stage, list[str]]]:
+    """生成可审计的任务执行计划。"""
+
+    rework_requested = getattr(args, "rework", None) is not None
+    mode = parse_task_mode(
+        resume=bool(getattr(args, "resume", False)),
+        failed=bool(getattr(args, "failed", False)),
+        rework=rework_requested,
+    )
+    # 先验证重做状态，即使本次不是 rework 也拒绝误传非法值。
+    if rework_requested:
+        parse_rework_statuses(args.rework)
+    stage_spec = getattr(args, "stages", None) or getattr(args, "stage", None)
+    stages = parse_stage_names(stage_spec)
+    ids = _get_task_ids(args)
+    states = load_state()
+    if getattr(args, "run_id", None):
+        manifest = load_execution_manifest(args.run_id)
+        if manifest is None:
+            raise ValueError(f"任务 run_id 不存在或没有不可变 manifest: {args.run_id}")
+    plan = {
+        stage: select_task_ids(ids, stage=stage, states=states, mode=mode)
+        for stage in stages
+    }
+    return mode, tuple(stage_cli_name(stage) for stage in stages), ids, plan
+
+
+async def _cmd_task(args: argparse.Namespace, run_id: str) -> int:
+    """执行统一任务命令；所有 Stage 共用同一生命周期模式。"""
+
+    try:
+        mode, stage_names, ids, task_plan = _build_task_plan(args)
+        stage_spec = getattr(args, "stages", None) or getattr(args, "stage", None)
+        stages = tuple(parse_stage_names(stage_spec))
+        rework_statuses = parse_rework_statuses(getattr(args, "rework", None)) if mode is TaskMode.REWORK else ("draft",)
+    except (OSError, ValueError) as exc:
+        print(f"参数错误：{exc}", file=sys.stderr)
+        return 2
+
+    selected_count = sum(len(values) for values in task_plan.values())
+    requested_stage_spec = getattr(args, "stages", None) or getattr(args, "stage", None) or "all"
+    requested_stage_names = (
+        [item.strip().lower() for item in str(requested_stage_spec).split(",") if item.strip()]
+        if str(requested_stage_spec).strip().lower() not in {"", "all"}
+        else list(stage_names)
+    )
+    plan_payload = {
+        "execution_id": run_id,
+        "source_run_id": getattr(args, "run_id", None),
+        "mode": mode.value,
+        "requested_ids": ids,
+        "requested_stages": requested_stage_names,
+        "resolved_stages": list(stage_names),
+        "selected_tasks": {
+            stage_cli_name(stage): values for stage, values in task_plan.items()
+        },
+    }
+    logger.info("任务计划 %s", plan_payload)
+    try:
+        save_execution_manifest(plan_payload)
+    except ValueError as exc:
+        print(f"任务计划错误：{exc}", file=sys.stderr)
+        return 2
+    if selected_count == 0:
+        print(json.dumps({"plan": plan_payload, "message": "没有符合当前模式的任务"}, ensure_ascii=False, indent=2))
+        return 0
+
+    from .pipeline import run_pipeline
+
+    stats, actual_run_id = await run_pipeline(
+        ids,
+        stages=stages,
+        run_id=run_id,
+        task_ids_by_stage=task_plan,
+        task_mode=mode.value,
+        rework_statuses=list(rework_statuses),
+    )
+
+    progress = load_progress(actual_run_id)
+    if progress is not None:
+        states = merge_run_progress(progress, load_state(), stats)
+        save_state(states)
+
+    result = {
+        "execution_id": actual_run_id,
+        "plan": plan_payload,
+        "stats": stats,
+    }
+    if getattr(args, "json", False) or getattr(args, "quiet", False):
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+    else:
+        _print_pipeline_summary(actual_run_id, stats)
+    return 0 if stats.get("pipeline", {}).get("success", True) else 1
+
+
 async def _cmd_pipeline(args: argparse.Namespace, run_id: str) -> int:
     """执行完整流水线（或指定 stages）"""
     stages = _parse_stages(getattr(args, "stages", None))
@@ -463,9 +595,9 @@ def _print_pipeline_summary(run_id: str, stats: dict) -> None:
 
 
 async def _cmd_cli(args: argparse.Namespace, run_id: str) -> int:
-    """交互式 CLI；Typical 保守运行，Custom 显式确认高风险参数。"""
+    """交互式 CLI：只收集统一 task 参数，实际执行复用 ``_cmd_task``。"""
     if not sys.stdin.isatty():
-        print("错误：cli 需要交互终端；自动化请使用 pipeline --ids/--id-file --json。")
+        print("错误：cli 需要交互终端；自动化请使用 task --ids/--id-file --json。")
         return 3
     print("KBD 交互式 CLI")
     print("将执行：抓取 → 导入 →（截图识别与分类并行）→ 关键信号抽取 → 审计")
@@ -475,27 +607,23 @@ async def _cmd_cli(args: argparse.Namespace, run_id: str) -> int:
     if not settings.INTERNAL_API_TOKEN:
         print("错误：内部 Token 未配置，已停止。请先设置 INTERNAL_API_TOKEN。")
         return 4
-    ids_text = input("请输入 KBD 案例 ID（逗号分隔）：").strip()
-    ids = _parse_ids(ids_text)
-    if not ids:
-        print("未输入有效案例 ID，已取消。")
-        return 3
+    try:
+        task_args = _collect_interactive_task_args()
+        if Stage.REVIEW_SIGNALS in parse_stage_names(task_args.stages):
+            require_shared_contracts()
+        mode, stage_names, ids, task_plan = _build_task_plan(task_args)
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"参数错误：{exc}", file=sys.stderr)
+        return 2
 
-    options = _cli_options()
-    print(f"本次将处理 {len(ids)} 个 KBD。截图识别成功与分类成功均为信号抽取的硬前置条件。")
-    print("\n本次实际运行参数（后端 run_pipeline）：")
-    print("  参数             当前值       中文含义")
-    print("  " + "-" * 96)
-    for key, value in options.items():
-        print(f"  {key:<16}= {str(value):<11}  {_CLI_OPTION_DESCRIPTIONS[key]}")
-    print("确认的意义：最后一次显式确认，防止在参数选定后误触发抓取、写库和 LLM 调用。")
+    _print_interactive_plan(task_args, mode, stage_names, ids, task_plan)
+    if not any(task_plan.values()):
+        print("没有符合当前模式的任务，已结束。")
+        return 0
     if not _prompt_yes_no("确认开始？", default=False):
         print("已取消，未执行任何处理。")
         return 130
-    from .pipeline import run_pipeline
-    stats, actual_run_id = await run_pipeline(ids, run_id=run_id, **options)
-    _print_pipeline_summary(actual_run_id, stats)
-    return 0 if stats.get("pipeline", {}).get("success", True) else 1
+    return await _cmd_task(task_args, run_id)
 
 
 def _prompt_yes_no(prompt: str, *, default: bool) -> bool:
@@ -531,82 +659,138 @@ def _prompt_choice(prompt: str, choices: tuple[tuple[str, str, str], ...], *, de
         print(f"请输入选项序号（{valid}）。")
 
 
-def _cli_options() -> dict[str, object]:
-    """收集交互 CLI 参数，返回可直接传入 run_pipeline 的参数字典。"""
+def _collect_interactive_task_args() -> argparse.Namespace:
+    """按统一任务模型收集交互参数。"""
 
-    mode = _prompt_choice(
-        "请选择运行模式：",
+    source = _prompt_choice(
+        "请选择任务范围：",
         (
-            ("1", "typical", "默认 Typical（推荐）：保守运行，不强制抓取、不覆盖已有记录"),
-            ("2", "custom", "自定义 Custom：逐项确认运行参数"),
+            ("1", "ids", "手动输入案例 ID（最高频，推荐）"),
+            ("2", "run-id", "选择历史 run-id 任务范围"),
+            ("3", "id-file", "指定 ID 文件"),
+            ("4", "excel", "指定 Excel 文件"),
         ),
         default="1",
     )
-    if mode == "typical":
-        options: dict[str, object] = {
-            "force_fetch": False,
-            "override": False,
-            "override_status": None,
-            "resume": False,
-            "failed_only": False,
-        }
-        print("已选择默认 Typical：不会强制重新抓取，也不会覆盖已有 KBD。")
-        return options
-    force_fetch = _prompt_yes_no("强制重新抓取已有缓存？", default=False)
-    override = _prompt_yes_no("覆盖已存在的 KBD？", default=False)
-    override_status: list[str] | None = None
-    if override:
-        scope = _prompt_choice(
-            "请选择覆盖范围：",
-            (
-                ("1", "draft", "仅 draft（推荐）"),
-                ("2", "all", "所有状态（包含 published，高风险）"),
-            ),
-            default="1",
-        )
-        if scope == "draft":
-            override_status = ["draft"]
-        else:
-            print("警告：所有状态包含 published，可能覆盖专家已审核内容。")
-            if not _prompt_yes_no("确认允许覆盖所有状态？", default=False):
-                override = False
-                override_status = None
-
-    resume = _prompt_yes_no("从数据库现状续跑并跳过已完成项？", default=False)
-    failed_only = _prompt_yes_no("仅处理抓取/Vision 失败项？", default=False)
-    if resume and failed_only:
-        print("提示：同时启用续跑和失败筛选时，将先筛选失败项，再按数据库状态跳过已完成项。")
-    return {
-        "force_fetch": force_fetch,
-        "override": override,
-        "override_status": override_status,
-        "resume": resume,
-        "failed_only": failed_only,
+    values: dict[str, object] = {
+        "command": "task", "excel": False, "ids": None,
+        "id_file": None, "run_id": None,
     }
+    if source == "ids":
+        values["ids"] = input("请输入 KBD 案例 ID（逗号分隔）：").strip()
+    elif source == "run-id":
+        values["run_id"] = _choose_history_run_id()
+    elif source == "id-file":
+        values["id_file"] = input("请输入 ID 文件路径：").strip()
+    else:
+        values["excel"] = True
+        values["excel_file"] = input(
+            "请输入 Excel 文件路径（直接回车使用 EXCEL_FILE）："
+        ).strip() or None
+
+    stage_choice = _prompt_choice(
+        "请选择执行阶段：",
+        (("1", "all", "ALL：全部六个阶段"), ("2", "selected", "指定阶段")),
+        default="1",
+    )
+    if stage_choice == "all":
+        stages = "all"
+    else:
+        print(
+            "阶段：1 fetch  2 import  3 classify  4 vision "
+            "5 extract-signals  6 review-signals"
+        )
+        stages = input("请输入阶段编号或名称（逗号分隔）：").strip()
+
+    mode = _prompt_choice(
+        "请选择执行模式：",
+        (
+            ("1", "default", "默认：未执行 + 失败"),
+            ("2", "resume", "断点续跑：仅未执行"),
+            ("3", "failed", "失败重试：仅失败"),
+            ("4", "rework", "重做：不论完成/失败"),
+        ),
+        default="1",
+    )
+    values.update({
+        "stages": stages,
+        "resume": mode == "resume",
+        "failed": mode == "failed",
+        "rework": None,
+    })
+    if mode == "rework":
+        print("可选状态：1 draft  2 published  3 rejected  4 archived")
+        status_input = input(
+            "请输入状态编号或名称（逗号分隔，直接回车默认 draft）："
+        ).strip()
+        values["rework"] = _parse_interactive_rework_statuses(status_input)
+
+    limit_input = input("最多处理多少个案例？直接回车表示不限制：").strip()
+    if limit_input:
+        if not limit_input.isdigit() or int(limit_input) <= 0:
+            raise ValueError("--limit 必须是正整数")
+        values["limit"] = int(limit_input)
+    else:
+        values["limit"] = None
+    values.update({"json": False, "quiet": False, "verbose": False})
+    return argparse.Namespace(**values)
 
 
-_CLI_OPTION_DESCRIPTIONS = {
-    "force_fetch": (
-        "是否忽略本地 cache，重新从 Support Portal 抓取原文和图片；"
-        "False=复用有效缓存，True=只重抓 Stage 1，不会自动覆盖数据库。"
-    ),
-    "override": (
-        "是否覆盖已经存在的 KBD 导入记录；False=保护性跳过已有记录，"
-        "True=允许 Stage 2 写入新的 Proposal。"
-    ),
-    "override_status": (
-        "允许覆盖的状态范围；None=后端默认仅 draft，['draft']=仅草稿，"
-        "['all']=包含 published，属于高风险覆盖。"
-    ),
-    "resume": (
-        "是否按数据库现状续跑；False=按本次输入执行各阶段，"
-        "True=跳过数据库已经完成的阶段，progress 文件只用于观察。"
-    ),
-    "failed_only": (
-        "是否只筛选 Fetch/Vision 自动识别出的失败或可重试案例；"
-        "False=处理全部输入 ID，True=用于故障重试，不会把普通成功案例重复送入 LLM。"
-    ),
-}
+def _parse_interactive_rework_statuses(value: str) -> str:
+    if not value:
+        return "draft"
+    aliases = {str(index): name for index, name in enumerate(REWORK_STATUS_NAMES, 1)}
+    selected = [aliases.get(item.strip(), item.strip().lower()) for item in value.split(",")]
+    parsed = ",".join(dict.fromkeys(selected))
+    parse_rework_statuses(parsed)
+    return parsed
+
+
+def _choose_history_run_id() -> str:
+    manifests_dir = settings.KBD_LOGS_DIR / "task-manifests"
+    manifests = sorted(
+        manifests_dir.glob("*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    if not manifests:
+        raise ValueError("当前没有可用的历史 run-id")
+    choices: list[tuple[str, str, str]] = []
+    for index, path in enumerate(manifests[:10], 1):
+        manifest = load_execution_manifest(path.stem) or {}
+        choices.append(
+            (
+                str(index),
+                path.stem,
+                f"{path.stem}：案例 {len(manifest.get('requested_ids', []))} 个，"
+                f"模式 {manifest.get('mode', '-')}",
+            )
+        )
+    choices.append(("m", "manual", "手动输入 run-id"))
+    selected = _prompt_choice("最近的历史任务：", tuple(choices), default="1")
+    if selected == "manual":
+        return input("请输入历史 run-id：").strip()
+    return selected
+
+
+def _print_interactive_plan(
+    args: argparse.Namespace,
+    mode: TaskMode,
+    stage_names: tuple[str, ...],
+    ids: list[str],
+    task_plan: dict[Stage, list[str]],
+) -> None:
+    requested = args.stages or getattr(args, "stage", None) or "all"
+    source = args.run_id or ("Excel" if args.excel else args.id_file or "手动输入")
+    print("\nKBD 任务执行计划")
+    print(f"任务来源：{source}")
+    print(f"案例数：{len(ids)}")
+    print(f"执行模式：{mode.value}")
+    print(f"用户请求阶段：{requested}")
+    print(f"最终执行阶段：{', '.join(stage_names)}")
+    print("阶段任务数：")
+    for stage, selected in task_plan.items():
+        print(f"  {stage_cli_name(stage):<18} {len(selected)}")
 
 
 async def _cmd_fetch(args: argparse.Namespace, run_id: str) -> None:
@@ -906,6 +1090,43 @@ def _cmd_config(_args: argparse.Namespace) -> None:
 
 # ─── 参数解析 ────────────────────────────────────────────────────────────────
 
+def _add_task_scope(p: argparse.ArgumentParser, *, required: bool = False) -> None:
+    """所有任务 Stage 共用的输入范围和生命周期参数。"""
+
+    source = p.add_mutually_exclusive_group(required=required)
+    source.add_argument("--excel", action="store_true", help="从 EXCEL_FILE 读取案例 ID")
+    source.add_argument("--ids", help="逗号分隔的案例 ID，如 29351,29352")
+    source.add_argument("--id-file", help="每行一个 ID 的文本文件路径")
+    source.add_argument("--run-id", help="使用某次历史任务运行记录中的案例范围")
+    p.add_argument("--limit", type=int, default=None, help="最多处理 N 条任务（必须为正整数）")
+    p.add_argument("--verbose", action="store_true", help="显示详细调试日志")
+
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--resume", action="store_true", help="只执行未完成任务")
+    mode.add_argument("--failed", action="store_true", help="只执行失败任务")
+    mode.add_argument(
+        "--rework",
+        nargs="?",
+        const="draft",
+        metavar="STATUS_LIST",
+        help="重做任务；不论完成/失败，默认只处理 draft，可写 --rework=draft,published",
+    )
+
+
+def _add_task_command_options(p: argparse.ArgumentParser) -> None:
+    _add_task_scope(p, required=True)
+    p.add_argument(
+        "--stages",
+        default=None,
+        help=(
+            "目标阶段（逗号分隔），默认 all；合法值："
+            + ",".join(ALL_STAGE_NAMES)
+        ),
+    )
+    p.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    p.add_argument("--quiet", action="store_true", help="只保留日志，不输出终端摘要")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m data-pipeline.kbd.run",
@@ -913,151 +1134,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    # 公共参数
-    def _add_common(p: argparse.ArgumentParser) -> None:
-        group = p.add_mutually_exclusive_group()
-        group.add_argument("--excel", action="store_true", help="从 Excel 读取全量 ID")
-        group.add_argument("--ids", help="逗号分隔的案例 ID，如 34977,36179")
-        group.add_argument("--id-file", help="每行一个 ID 的文本文件路径")
-        p.add_argument("--limit", type=int, default=None, help="最多处理 N 条（测试用）")
-        p.add_argument("--verbose", action="store_true", help="终端显示详细调试日志（默认仅显示阶段事件）")
+    p_task = sub.add_parser("task", help="统一 KBD 任务执行器（六个 Stage 共用同一套参数）")
+    _add_task_command_options(p_task)
 
-    # pipeline 子命令
-    p_pipeline = sub.add_parser("pipeline", help="运行完整流水线（或指定 stages）")
-    _add_common(p_pipeline)
-    p_pipeline.add_argument(
-        "--stages",
-        help=(
-            "指定 stages（逗号分隔）：fetch,import,vision,classify,"
-            "extract-signals,review-signals"
-        ),
-    )
-    # 抓取阶段参数
-    p_pipeline.add_argument(
-        "--force-fetch",
-        action="store_true",
-        help="强制重新抓取已完成的案例（仅影响 Stage 1）",
-    )
-    # 导入阶段参数
-    p_pipeline.add_argument(
-        "--override",
-        action="store_true",
-        help="强制覆盖已存在的记录（仅影响 Stage 2 导入阶段）",
-    )
-    p_pipeline.add_argument(
-        "--override-status",
-        type=str,
-        default=None,
-        help=(
-            "仅覆盖指定状态的记录（逗号分隔）。"
-            "不传=默认仅draft；'all'=所有状态；'draft,published'=仅指定状态"
-        ),
-    )
-    # 进度追踪参数
-    p_pipeline.add_argument(
-        "--resume",
-        action="store_true",
-        help="从上次中断处继续，自动跳过已完成的案例",
-    )
-    p_pipeline.add_argument(
-        "--resume-run-id",
-        type=str,
-        default=None,
-        help="指定要恢复的 run_id（不传则自动查找最新的 progress 文件）",
-    )
-    p_pipeline.add_argument(
-        "--failed-only",
-        action="store_true",
-        help="仅处理失败的案例（有 .failed 标记或识别为无文字）",
-    )
-    p_pipeline.add_argument("--json", action="store_true", help="输出机器可读 JSON（供 CI/自动化使用）")
-    p_pipeline.add_argument("--quiet", action="store_true", help="不输出中文终端摘要，仅保留日志文件")
+    sub.add_parser("cli", help="统一 task 任务的交互式前端")
 
-    # 交互 CLI：不隐式执行危险覆盖操作，输入与确认都必须来自 TTY。
-    sub.add_parser("cli", help="交互式 KBD 生产 CLI（适合人工操作）")
-
-    # 单独 stage 子命令
+    # 每个 Stage 都是同一种任务，使用完全相同的生命周期参数。
     for name, help_text in [
-        ("fetch",    "Stage 1：抓取 API + 下载图片"),
-        ("import",   "Stage 2：语义转换 + 原子入库"),
-        ("classify", "Stage 3：AI 分类（调用 kb-service API）"),
-        ("vision",   "Stage 4：图片语义化（Vision LLM）"),
+        ("fetch", "Stage 1：抓取 API + 下载图片"),
+        ("import", "Stage 2：语义转换 + 原子入库"),
+        ("classify", "Stage 3：AI 分类"),
+        ("vision", "Stage 4：图片语义化"),
+        ("extract-signals", "Stage 5：关键信号抽取"),
+        ("review-signals", "Stage 6：Shared Resolution Runtime 全量审查"),
     ]:
-        p_sub = sub.add_parser(name, help=help_text)
-        _add_common(p_sub)
-        # fetch 子命令的 force 参数
-        if name == "fetch":
-            p_sub.add_argument(
-                "--force",
-                action="store_true",
-                help="强制重新抓取已完成的案例",
-            )
-            p_sub.add_argument(
-                "--resume",
-                action="store_true",
-                help="从上次中断处继续",
-            )
-            p_sub.add_argument(
-                "--resume-run-id",
-                type=str,
-                default=None,
-                help="指定要恢复的 run_id",
-            )
-            p_sub.add_argument(
-                "--failed-only",
-                action="store_true",
-                help="仅处理抓取失败的案例",
-            )
-        # vision 子命令的 failed-only 参数
-        if name == "vision":
-            p_sub.add_argument(
-                "--failed-only",
-                action="store_true",
-                help="仅处理 Vision 失败的案例（.desc.failed 或识别为无文字）",
-            )
-        # import 子命令的 override 参数
-        if name == "import":
-            p_sub.add_argument(
-                "--override",
-                action="store_true",
-                help="强制覆盖已存在的记录",
-            )
-            p_sub.add_argument(
-                "--override-status",
-                type=str,
-                default=None,
-                help=(
-                    "仅覆盖指定状态的记录（逗号分隔）。"
-                    "不传=默认仅draft；'all'=所有状态；'draft,published'=仅指定状态"
-                ),
-            )
+        p_stage = sub.add_parser(name, help=help_text)
+        _add_task_scope(p_stage, required=True)
+        p_stage.set_defaults(stage=name)
+        p_stage.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+        p_stage.add_argument("--quiet", action="store_true", help="只保留日志，不输出终端摘要")
 
-    # Stage 5：独立关键信号抽取。别名 extract 兼容既有 stage 口径。
-    p_extract = sub.add_parser(
-        "extract-signals",
-        help="Stage 5：抽取关键信号 Proposal",
-    )
-    _add_common(p_extract)
-
-    # Stage 6：Shared Resolution Runtime 全量 Signal 审查。
-    p_signal_review = sub.add_parser(
-        "review-signals",
-        help="Stage 6：基于 Shared Resolution Runtime 审查全部 Signal",
-    )
-    review_source = p_signal_review.add_mutually_exclusive_group(required=True)
-    review_source.add_argument("--stdin", action="store_true", help="从标准输入读取 JSON 数组")
-    review_source.add_argument("--file", help="从 UTF-8 JSON 文件读取数组")
-    review_source.add_argument("--all", action="store_true", help="只读审查数据库全部 KBD")
-    review_source.add_argument("--excel", action="store_true", help="按 Excel 中的案例 ID 查询数据库")
-    review_source.add_argument("--ids", help="按逗号分隔的 support_id 查询数据库")
-    review_source.add_argument("--id-file", help="按每行一个 support_id 的文件查询数据库")
-    p_signal_review.add_argument("--limit", type=int, default=None, help="限制 Excel/ID 文件输入数量")
-    p_signal_review.add_argument("--output", help="将完整 JSON 报告写入文件；终端仅打印摘要")
-    p_signal_review.add_argument(
-        "--fail-on-blocked",
-        action="store_true",
-        help="存在 BLOCKED_SIGNAL_REVIEW 时返回 1，供 CI 门禁使用",
-    )
+    # 文件/stdin 是审查报告工具，不属于任务范围；避免破坏 Stage 的统一任务契约。
+    p_input_review = sub.add_parser("review-input", help="审查外部 JSON 输入（不创建 KBD 任务）")
+    input_source = p_input_review.add_mutually_exclusive_group(required=True)
+    input_source.add_argument("--stdin", action="store_true", help="从标准输入读取 JSON 数组")
+    input_source.add_argument("--file", help="从 UTF-8 JSON 文件读取数组")
+    p_input_review.add_argument("--output", help="将完整 JSON 报告写入文件")
+    p_input_review.add_argument("--fail-on-blocked", action="store_true", help="BLOCKED 时返回 1")
 
     # review-list 子命令
     p_review = sub.add_parser("review-list", help="列出待审核案例")
@@ -1073,11 +1176,15 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
 
-    # 完整 pipeline 默认包含 Stage 6；在任何 fetch/import/LLM 调用前确认其
-    # 唯一外部源码依赖可用，避免跑完前五阶段后才因 shared 导入失败。
-    requires_shared_contracts = args.command in {"review-signals", "cli"}
-    if args.command == "pipeline":
-        requires_shared_contracts = Stage.REVIEW_SIGNALS in _parse_stages(args.stages)
+    # 包含 Stage 6 的任务在任何生产副作用前确认 Shared Runtime 可用。
+    requires_shared_contracts = False
+    if args.command == "task":
+        try:
+            requires_shared_contracts = Stage.REVIEW_SIGNALS in parse_stage_names(args.stages)
+        except ValueError as exc:
+            parser.error(str(exc))
+    elif args.command in {"review-signals", "review-input"}:
+        requires_shared_contracts = True
     if requires_shared_contracts:
         try:
             require_shared_contracts()
@@ -1085,16 +1192,17 @@ def main() -> None:
             parser.error(str(exc))
 
     cmd_map = {
-        "pipeline":    _cmd_pipeline,
-        "cli":          _cmd_cli,
-        "fetch":       _cmd_fetch,
-        "vision":      _cmd_vision,
-        "import":      _cmd_import,
-        "classify":    _cmd_classify,
-        "extract-signals": _cmd_extract_signals,
-        "review-signals": _cmd_review_signals,
+        "task": _cmd_task,
+        "cli": _cmd_cli,
+        "fetch": _cmd_task,
+        "import": _cmd_task,
+        "classify": _cmd_task,
+        "vision": _cmd_task,
+        "extract-signals": _cmd_task,
+        "review-signals": _cmd_task,
+        "review-input": _cmd_review_signals,
         "review-list": _cmd_review_list,
-        "config":      lambda a: (_cmd_config(a), None)[1],
+        "config": lambda a: (_cmd_config(a), None)[1],
     }
 
     cmd = cmd_map.get(args.command)
@@ -1107,10 +1215,8 @@ def main() -> None:
         _cmd_config(args)
         return
 
-    # 初始化日志（终端 + 文本文件 + JSONL 排障文件）
-    # 如果有 --resume-run-id 参数，使用它；否则自动生成
-    resume_run_id = getattr(args, "resume_run_id", None)
-    run_id = _setup_logging(resume_run_id, verbose=getattr(args, "verbose", False))
+    # 初始化本次执行日志；--run-id 只用于任务范围，不复用为本次 execution_id。
+    run_id = _setup_logging(None, verbose=getattr(args, "verbose", False))
 
     # 执行异步命令，传递 run_id
     exit_code = asyncio.run(cmd(args, run_id))
