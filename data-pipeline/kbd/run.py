@@ -71,6 +71,7 @@ _ANSI = {
     "red": "\033[31m",
     "green": "\033[32m",
     "yellow": "\033[33m",
+    "blue": "\033[94m",
     "cyan": "\033[36m",
     "gray": "\033[90m",
     "bold": "\033[1m",
@@ -133,7 +134,8 @@ class _ConsoleFormatter(logging.Formatter):
         message = record.getMessage()
         # 阶段 banner 不带长前缀，直接占一整行，便于快速定位阶段边界。
         if self._STAGE_BANNER_RE.match(message):
-            return _paint(message, "cyan")
+            # Stage Banner 与完成摘要共享同一亮蓝色视觉语言。
+            return _paint(message, "blue")
 
         rendered = super().format(record)
         has_error_counter = self._has_positive_counter(
@@ -615,9 +617,12 @@ def _print_pipeline_summary(run_id: str, stats: dict) -> None:
             cells.append(_paint(cell, color, enabled=enabled) if index == 1 and color else cell)
         return "│" + "│".join(cells) + "│"
 
-    print("\n" + "=" * table_width)
-    print(_paint(_center_display("KBD 流水线完成摘要", table_width), "bold", enabled=enabled))
-    print("=" * table_width)
+    # 摘要标题及其上下边框作为一个完整的视觉锚点使用明确亮蓝色，
+    # 不依赖终端对 bold 的主题映射。
+    summary_border = "=" * table_width
+    print("\n" + _paint(summary_border, "blue", enabled=enabled))
+    print(_paint(_center_display("KBD 流水线完成摘要", table_width), "blue", enabled=enabled))
+    print(_paint(summary_border, "blue", enabled=enabled))
     print(f"运行编号   : {run_id}")
     print(f"关联 trace : {get_trace_id() or '-'}（用于串联 kb-service 服务端日志）")
     has_execution_scope = any(
@@ -639,6 +644,11 @@ def _print_pipeline_summary(run_id: str, stats: dict) -> None:
         result_color = "red"
     print(f"总体结果   : {_paint(result_text, result_color, enabled=enabled)}")
     print(f"KBD 完成数 : {completed}/{total}")
+    vision_counts = stats.get("vision", {}).get("case_status_counts")
+    if vision_counts:
+        # 这是 Vision 的 KBD 案例级聚合结果，必须靠近总体结果；它不是
+        # “最后附加的一条日志”，也不代表执行顺序上的最后一个事件。
+        print("Vision KBD 状态：" + " / ".join(f"{key}={value}" for key, value in vision_counts.items()))
     print(border("┌", "┬", "┐"))
     print(row_text(list(headers)))
     print(border("├", "┼", "┤"))
@@ -666,9 +676,6 @@ def _print_pipeline_summary(run_id: str, stats: dict) -> None:
     if no_work:
         print("无需执行阶段：" + "；".join(f"{label}（{reason}）" for label, reason in no_work))
 
-    if stats.get("vision", {}).get("case_status_counts"):
-        counts = stats["vision"]["case_status_counts"]
-        print("\nVision KBD 状态：" + " / ".join(f"{key}={value}" for key, value in counts.items()))
     if stats.get("review_signals", {}).get("issue_counts"):
         issues = stats["review_signals"]["issue_counts"]
         print("统一信号审查问题：" + " / ".join(f"{key}={value}" for key, value in issues.items()))
