@@ -1608,7 +1608,7 @@ class InvestigationAgent(BaseAgent):
         assistant_type: str = "htp-agent",
     ) -> list[str]:
         """Construct next round of manual evidence request text.
-        
+
         Uses LLM to judge if user has provided the information requested by evidence requests.
         """
 
