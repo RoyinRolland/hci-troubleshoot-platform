@@ -1,4 +1,4 @@
-"""在线语义入口真实编排：纯语义分类、执行白名单与多轮上下文。"""
+"""在线语义入口真实编排:纯语义分类,执行白名单与多轮上下文."""
 
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -100,13 +100,25 @@ def test_repeated_semantic_question_is_bounded_without_counting_user_answers():
     assert not InvestigationAgent._semantic_question_exhausted([{"role": "user", "content": question}] * 3, question)
 
 
-def test_answered_semantic_question_advances_even_after_prior_retries():
-    question = "当前报错是否为“缺少介质驱动程序”？"
-    result = InvestigationAgent._semantic_guidance_messages(
+@pytest.mark.asyncio
+async def test_answered_semantic_question_advances_even_after_prior_retries():
+    question = "当前报错是否为\"缺少介质驱动程序\"？"
+    # 创建一个 mock 的 InvestigationAgent 实例
+    agent = InvestigationAgent(
+        ai_registry=MagicMock(),
+        kb_client=MagicMock(),
+        tool_executor=MagicMock(),
+    )
+    # Mock LLM 调用，让它返回 NO（表示证据未满足）
+    async def mock_invoke(*args, **kwargs):
+        return MagicMock(content="NO")
+    agent._ai_registry.get_client.return_value.invoke = mock_invoke
+
+    result = await agent._semantic_guidance_messages(
         [
             {"role": "assistant", "content": question},
             {"role": "assistant", "content": question},
-            {"role": "user", "content": "当前报错是“缺少介质驱动程序”"},
+            {"role": "user", "content": '当前报错是"缺少介质驱动程序"'},
         ],
         {
             "next_action": {"question": question},
@@ -114,16 +126,16 @@ def test_answered_semantic_question_advances_even_after_prior_retries():
         },
     )
 
-    assert result == ["当前只能请求补充证据：请提供安装失败截图"]
+    assert result == ["当前只能请求补充证据:请提供安装失败截图"]
 
 
 def test_evidence_request_satisfied_by_user_keywords():
-    """用户消息中包含 evidence request 的多个关键词时，视为已满足。"""
+    """用户消息中包含 evidence request 的多个关键词时,视为已满足."""
     messages = [
-        {"role": "assistant", "content": "当前只能请求补充证据：请提供所用 ISO 的文件名、SHA1 和文件大小"},
-        {"role": "user", "content": "iso文件名是test.iso、sha1是643af07a077069e7c0784986eab7796e9a1fb854、文件大小1G"},
+        {"role": "assistant", "content": "当前只能请求补充证据:请提供所用 ISO 的文件名,SHA1 和文件大小"},
+        {"role": "user", "content": "iso文件名是test.iso,sha1是643af07a077069e7c0784986eab7796e9a1fb854,文件大小1G"},
     ]
-    assert InvestigationAgent._evidence_request_satisfied(messages, "请提供所用 ISO 的文件名、SHA1 和文件大小")
+    assert InvestigationAgent._evidence_request_satisfied(messages, "请提供所用 ISO 的文件名,SHA1 和文件大小")
 
 
 def test_iso_mention_alone_does_not_satisfy_integrity_evidence_request():
@@ -132,34 +144,61 @@ def test_iso_mention_alone_does_not_satisfy_integrity_evidence_request():
     ]
 
     assert not InvestigationAgent._evidence_request_satisfied(
-        messages, "请提供所用 ISO 的文件名、SHA1 和文件大小"
+        messages, "请提供所用 ISO 的文件名,SHA1 和文件大小"
     )
 
 
 def test_evidence_request_satisfied_controller_driver():
-    """用户提到磁盘控制器和驱动时，满足对应 evidence request。"""
+    """用户提到磁盘控制器和驱动时,满足对应 evidence request."""
     messages = [
-        {"role": "assistant", "content": "当前只能请求补充证据：请确认虚拟磁盘控制器类型以及是否已加载对应驱动"},
+        {"role": "assistant", "content": "当前只能请求补充证据:请确认虚拟磁盘控制器类型以及是否已加载对应驱动"},
         {"role": "user", "content": "虚拟磁盘控制器类型是virtio并且已经加载virtio驱动"},
     ]
     assert InvestigationAgent._evidence_request_satisfied(
-        messages, "请确认虚拟磁盘控制器类型以及是否已加载对应驱动（如 VirtIO）"
+        messages, "请确认虚拟磁盘控制器类型以及是否已加载对应驱动(如 VirtIO)"
     )
 
 
 def test_evidence_request_not_satisfied_when_no_match():
-    """用户消息与 evidence request 无关时，不应标记为已满足。"""
+    """用户消息与 evidence request 无关时,不应标记为已满足."""
     messages = [
-        {"role": "assistant", "content": "当前只能请求补充证据：请提供安装失败截图"},
-        {"role": "user", "content": "你好，请问这个问题怎么解决"},
+        {"role": "assistant", "content": "当前只能请求补充证据:请提供安装失败截图"},
+        {"role": "user", "content": "你好,请问这个问题怎么解决"},
     ]
     assert not InvestigationAgent._evidence_request_satisfied(messages, "请提供安装失败界面的完整报错截图")
 
 
-def test_guidance_filters_already_provided_evidence():
+@pytest.mark.asyncio
+async def test_guidance_filters_already_provided_evidence():
     """用户已提供的 evidence request 不应重复出现在 guidance 输出中。"""
-    question = '当前报错是否为“缺少介质驱动程序”？'
-    result = InvestigationAgent._semantic_guidance_messages(
+    question = '当前报错是否为"缺少介质驱动程序"?'
+    # 创建一个 mock 的 InvestigationAgent 实例
+    agent = InvestigationAgent(
+        ai_registry=MagicMock(),
+        kb_client=MagicMock(),
+        tool_executor=MagicMock(),
+    )
+    # Mock LLM 调用，让它根据内容判断
+    async def mock_invoke(*args, **kwargs):
+        # 从 prompt 中提取 evidence request
+        messages = kwargs.get('messages', [])
+        prompt = messages[-1].get('content', '') if messages else ''
+
+        # 简单的判断逻辑：如果用户提供了 ISO 文件名但没有 SHA1 和大小，则 ISO 请求未满足
+        if 'ISO' in prompt and '文件名' in prompt and 'SHA1' in prompt:
+            # 这是 ISO 完整性请求，用户只提供了文件名，应该返回 NO
+            return MagicMock(content="NO")
+        elif '截图' in prompt:
+            # 截图请求，用户没有提供，返回 NO
+            return MagicMock(content="NO")
+        elif '控制器' in prompt:
+            # 控制器请求，用户没有明确提供，返回 NO
+            return MagicMock(content="NO")
+        return MagicMock(content="YES")
+
+    agent._ai_registry.get_client.return_value.invoke = mock_invoke
+
+    result = await agent._semantic_guidance_messages(
         [
             {"role": "assistant", "content": "目前无法确认根因。" + question},
             {"role": "assistant", "content": "当前只能请求补充证据：请提供 ISO 文件名；请提供截图；请确认磁盘控制器"},
@@ -180,7 +219,7 @@ def test_guidance_filters_already_provided_evidence():
             ],
         },
     )
-    # 缺少合法 SHA1 和文件大小时，ISO 完整性证据不能被仅有的“iso 文件名”误过滤。
+    # 缺少合法 SHA1 和文件大小时，ISO 完整性证据不能被仅有的"iso 文件名"误过滤。
     assert any("语义案例" in item for item in result)
     evidence = next(item for item in result if "当前只能请求补充证据" in item)
     assert "ISO" in evidence
@@ -190,7 +229,7 @@ def test_guidance_filters_already_provided_evidence():
 
 @pytest.mark.asyncio
 async def test_matched_strong_history_still_exposes_guidance_after_inconclusive_cdd(monkeypatch):
-    """无关历史任务命中不能吞掉安全的 guidance_only 人工补证据路径。"""
+    """无关历史任务命中不能吞掉安全的 guidance_only 人工补证据路径."""
 
     class Diagnostic:
         def __init__(self, **kwargs):
@@ -212,7 +251,7 @@ async def test_matched_strong_history_still_exposes_guidance_after_inconclusive_
                         match_kbd_ids={"strong"},
                     )
                 ],
-                diagnosis_report="原 CDD 仍无法确认。",
+                diagnosis_report="原 CDD 仍无法确认.",
                 conclusion_level="INCONCLUSIVE",
                 candidate_states={"strong": "INCONCLUSIVE"},
             )
@@ -299,7 +338,7 @@ async def test_matched_strong_history_still_exposes_guidance_after_inconclusive_
 
 @pytest.mark.asyncio
 async def test_pending_guidance_skips_cdd_and_advances_to_manual_evidence(monkeypatch):
-    """客户已回答语义澄清后，只续接补证据，不重跑全量 CDD。"""
+    """客户已回答语义澄清后,只续接补证据,不重跑全量 CDD."""
 
     class Diagnostic:
         def __init__(self, **kwargs):
@@ -338,7 +377,7 @@ async def test_pending_guidance_skips_cdd_and_advances_to_manual_evidence(monkey
             "candidates": [
                 {"kbd_id": "guidance", "manual_evidence_request": ["请提供安装失败截图"]}
             ],
-            "next_action": {"question": "当前报错是否为“缺少介质驱动程序”？"},
+            "next_action": {"question": '当前报错是否为"缺少介质驱动程序"?'},
         }
     )
     registry = MagicMock()
@@ -352,8 +391,8 @@ async def test_pending_guidance_skips_cdd_and_advances_to_manual_evidence(monkey
             case_id="case",
             category_id="虚拟机-001",
             messages=[
-                {"role": "assistant", "content": "当前只能请求补充证据：请提供安装失败截图"},
-                {"role": "user", "content": "当前报错是“缺少介质驱动程序”"},
+                {"role": "assistant", "content": "当前只能请求补充证据:请提供安装失败截图"},
+                {"role": "user", "content": '当前报错是"缺少介质驱动程序"'},
             ],
         )
     ]
