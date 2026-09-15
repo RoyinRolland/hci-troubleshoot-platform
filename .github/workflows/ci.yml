@@ -60,10 +60,32 @@ jobs:
       deploy_services: ${{ steps.image-plan.outputs.deploy_services || '' }}
       has_deploy_services: ${{ steps.image-plan.outputs.has_deploy_services || 'false' }}
       db_migrate: ${{ steps.image-plan.outputs.db_migrate || 'false' }}
+      # push to main 时检测是否来自 PR squash merge；若是则 unit/integration 测试
+      # 已在 PR CI 通过，无需重复执行，节省 ~5 分钟。
+      from_pr_merge: ${{ steps.pr-merge-detect.outputs.from_pr_merge || 'false' }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           fetch-depth: 0
+
+      # push to main 时检测是否来自 PR squash merge。GitHub squash merge 的 commit
+      # message 格式固定为 "<title> (#<number>)"，用此特征判断。如果是 PR 合并，
+      # unit-tests/integration-tests 已在 PR CI 通过，push 时跳过重复执行。
+      - name: 检测 push 是否来自 PR 合并
+        id: pr-merge-detect
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=%s)
+          if echo "$COMMIT_MSG" | grep -qE '\(#[0-9]+\)$'; then
+            PR_NUM=$(echo "$COMMIT_MSG" | grep -oE '\(#[0-9]+\)$' | tr -d '(#)')
+            echo "检测到 PR squash merge：PR #$PR_NUM"
+            echo "from_pr_merge=true" >> $GITHUB_OUTPUT
+            echo "pr_number=$PR_NUM" >> $GITHUB_OUTPUT
+          else
+            echo "非 PR 合并提交（直接 push 或 merge commit），需要运行完整测试"
+            echo "from_pr_merge=false" >> $GITHUB_OUTPUT
+          fi
+
       - uses: dorny/paths-filter@0e4a8c6effa4802afeda77dc8d303f8176d7dfad
         id: filter
         with:
@@ -422,9 +444,11 @@ jobs:
     needs: [changes]
     env:
       CI_TRACE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-frontend-check
+    # PR 合并到 main 时跳过：前端检查已在 PR CI 通过，避免重复运行。
+    # 直接 push / workflow_dispatch 仍运行作为安全兜底。
     if: |
       github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.from_pr_merge != 'true') ||
       (github.event_name == 'pull_request' && needs.changes.outputs.frontend == 'true')
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -758,10 +782,12 @@ jobs:
     env:
       HCI_TESTING: "1"
       CI_TRACE_ID: ci-${{ github.run_id }}-${{ github.run_attempt }}-unit-tests
+    # push to main 且来自 PR squash merge 时跳过：测试已在 PR CI 通过，避免重复执行。
+    # 直接 push / workflow_dispatch / merge_group 仍运行完整测试作为安全兜底。
     if: |
       (
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.from_pr_merge != 'true') ||
         github.event_name == 'merge_group' ||
         (github.event_name == 'pull_request' && (needs.changes.outputs.backend == 'true' || needs.changes.outputs.unit_test_mode == 'full'))
       )
@@ -901,10 +927,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     needs: [changes]
+    # push to main 且来自 PR squash merge 时跳过：测试已在 PR CI 通过，避免重复执行。
     if: |
       (
         github.event_name == 'workflow_dispatch' ||
-        (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.from_pr_merge != 'true') ||
         github.event_name == 'merge_group' ||
         (github.event_name == 'pull_request' && needs.changes.outputs.unit_test_mode == 'full')
       )
@@ -987,8 +1014,13 @@ jobs:
     name: 发布元数据产物
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    needs: [unit-tests, integration-tests, security-tests]
-    if: always() && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && (needs.unit-tests.result == 'success') && (needs.integration-tests.result == 'success') && (needs.security-tests.result == 'success')
+    needs: [changes, unit-tests, integration-tests, security-tests]
+    # from_pr_merge 时 unit-tests/integration-tests 被跳过（'skipped'），视为通过。
+    if: |
+      always() && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+      && (needs.unit-tests.result == 'success' || needs.unit-tests.result == 'skipped' || needs.changes.outputs.from_pr_merge == 'true')
+      && (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped' || needs.changes.outputs.from_pr_merge == 'true')
+      && needs.security-tests.result == 'success'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
@@ -1025,7 +1057,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     needs: [changes, unit-tests, integration-tests, security-tests]
-    if: always() && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch') && (needs.unit-tests.result == 'success') && (needs.integration-tests.result == 'success') && (needs.security-tests.result == 'success')
+    # from_pr_merge 时 unit-tests/integration-tests 被跳过（'skipped'），视为通过。
+    if: |
+      always() && (github.event_name == 'push' && github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+      && (needs.unit-tests.result == 'success' || needs.unit-tests.result == 'skipped' || needs.changes.outputs.from_pr_merge == 'true')
+      && (needs.integration-tests.result == 'success' || needs.integration-tests.result == 'skipped' || needs.changes.outputs.from_pr_merge == 'true')
+      && needs.security-tests.result == 'success'
     outputs:
       image_tag: ${{ steps.tag.outputs.tag }}
       image_matrix: ${{ needs.changes.outputs.image_matrix }}
