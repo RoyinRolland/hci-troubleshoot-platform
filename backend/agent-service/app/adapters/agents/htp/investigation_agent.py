@@ -1,22 +1,22 @@
 """
-InvestigationAgent: S1-S4 诊断调查 Agent（继承 BaseAgent）
+InvestigationAgent: S1-S4 诊断调查 Agent(继承 BaseAgent)
 
-职责：
-  - 使用 S0 已确认分类加载完整、版本固定的 SOP/KBD 清单
+职责:
+  - 使用 S0 已确认分类加载完整,版本固定的 SOP/KBD 清单
   - 执行 KBD 关键信号并按证据门禁判定候选案例
-  - 流式输出诊断进展（步骤执行、阶段更新）
+  - 流式输出诊断进展(步骤执行,阶段更新)
   - 生成结构化诊断报告
 
-执行模式（T-AGT-22 统一后）：
-  sop    → ReactEngine + SOP 导航工具注入（动态获取节点内容）
-  kbd    → CDD 模式：结构化关键信号采集与证据匹配
-  无知识 → 显式升级人工，不生成知识库外命令或根因
+执行模式(T-AGT-22 统一后):
+  sop    → ReactEngine + SOP 导航工具注入(动态获取节点内容)
+  kbd    → CDD 模式:结构化关键信号采集与证据匹配
+  无知识 → 显式升级人工,不生成知识库外命令或根因
 
-设计：
-  - think()：根据当前 CDD 状态决定下一步工具调用（ToolCall），
-             或在锁定案例后返回诊断报告（str）
-  - act()：执行 ToolExecutor，返回观察结果
-  - process()：CDD 驱动的完整诊断流程，含流式事件
+设计:
+  - think():根据当前 CDD 状态决定下一步工具调用(ToolCall),
+             或在锁定案例后返回诊断报告(str)
+  - act():执行 ToolExecutor,返回观察结果
+  - process():CDD 驱动的完整诊断流程,含流式事件
 """
 
 from __future__ import annotations
@@ -68,11 +68,11 @@ _RETRIEVAL_CONTROL_RE = re.compile(
 
 
 class InvestigationAgent(BaseAgent):
-    """S1-S4 诊断调查 Agent（CDD 驱动）。
+    """S1-S4 诊断调查 Agent(CDD 驱动).
 
-    核心流程：
+    核心流程:
       1. 按 S0 已确认分类加载完整 SOP/KBD 清单
-      2. 若找到 SOP → ReactEngine + SOP 导航工具注入（T-AGT-22）
+      2. 若找到 SOP → ReactEngine + SOP 导航工具注入(T-AGT-22)
       3. 无 SOP 时执行全部可执行 KBD 的关键信号并生成证据报告
       4. 若无知识或证据链不完整 → 显式升级人工
     """
@@ -121,10 +121,10 @@ class InvestigationAgent(BaseAgent):
     # ─── BaseAgent 抽象方法实现 ─────────────────────────────────────────────────
 
     async def think(self, context: list[Message]) -> Step:
-        """根据当前 CDD 状态决定下一步（仅在 run() 内部调用）。
+        """根据当前 CDD 状态决定下一步(仅在 run() 内部调用).
 
-        InvestigationAgent 的控制逻辑主要在 process() 中实现（CDD 驱动），
-        此方法保留为 BaseAgent 协议的实现，供非流式路径使用。
+        InvestigationAgent 的控制逻辑主要在 process() 中实现(CDD 驱动),
+        此方法保留为 BaseAgent 协议的实现,供非流式路径使用.
         """
         # KBD 诊断已完成：返回最终报告
         if self._kbd_diag and self._kbd_diag.get_result():
@@ -133,7 +133,7 @@ class InvestigationAgent(BaseAgent):
         return "诊断进行中"
 
     async def act(self, tool_call: ToolCall) -> Observation:
-        """执行工具调用（由 CDD 引擎内部协调，外部调用应使用 process()）。"""
+        """执行工具调用(由 CDD 引擎内部协调,外部调用应使用 process())."""
         try:
             result = await self._tool_executor.execute(tool_call.name, tool_call.args)
             return Observation(tool_call=tool_call, result=result, error=None)
@@ -156,24 +156,24 @@ class InvestigationAgent(BaseAgent):
         execution_mode: str = "safe-only",
         sop_resume_context: dict[str, Any] | None = None,  # T-AGT-23: SOP 执行恢复上下文
     ) -> AsyncGenerator[AgentEvent, None]:
-        """S1-S4 诊断调查完整流程（流式）。
+        """S1-S4 诊断调查完整流程(流式).
 
         Args:
             session_id: 会话 ID
-            messages: OpenAI 格式消息列表（对话历史）
-            category_id: S0 确认的故障分类编码，如 "虚拟机-003"
-            diagnostic_stage: 当前阶段（S1/S2/S3/S4）
-            env_context: 环境上下文（含 vm_name、host_id 等占位符替换所需键值）
+            messages: OpenAI 格式消息列表(对话历史)
+            category_id: S0 确认的故障分类编码,如 "虚拟机-003"
+            diagnostic_stage: 当前阶段(S1/S2/S3/S4)
+            env_context: 环境上下文(含 vm_name,host_id 等占位符替换所需键值)
             assistant_type: 助手类型标识
             case_id: 工单 ID
             user_id: 用户 ID
-            sop_resume_context: SOP 执行恢复上下文（T-AGT-23，用于断线重连恢复）
+            sop_resume_context: SOP 执行恢复上下文(T-AGT-23,用于断线重连恢复)
 
         Yields:
             AgentStageUpdate(stage="investigation_start") — 开始
             AgentStageUpdate(stage="cdd_*")               — CDD 步骤事件
             AgentTextChunk                                — 诊断报告文本
-            AgentStageUpdate(stage="S4")                  — 根因确认，推进阶段
+            AgentStageUpdate(stage="S4")                  — 根因确认,推进阶段
         """
         ai_client = self._ai_registry.get_client(assistant_type)
         if not ai_client:
@@ -430,7 +430,7 @@ class InvestigationAgent(BaseAgent):
                 stage="semantic_entry_fallback", metadata=semantic_result or {"reason": "service_unavailable"}
             )
             if (semantic_result or {}).get("decision") == "inconclusive":
-                guidance_messages = self._semantic_guidance_messages(messages, semantic_result or {})
+                guidance_messages = await self._semantic_guidance_messages(messages, semantic_result or {}, assistant_type)
                 if guidance_messages:
                     for content in guidance_messages:
                         yield AgentTextChunk(content=content)
@@ -581,7 +581,7 @@ class InvestigationAgent(BaseAgent):
                         yield event
                     kbd_result = self._kbd_diag.get_result()
             elif (semantic_result or {}).get("decision") == "inconclusive":
-                guidance_messages = self._semantic_guidance_messages(messages, semantic_result or {})
+                guidance_messages = await self._semantic_guidance_messages(messages, semantic_result or {}, assistant_type)
                 if guidance_messages:
                     for content in guidance_messages:
                         yield AgentTextChunk(content=content)
@@ -635,29 +635,29 @@ class InvestigationAgent(BaseAgent):
         execution_mode: str = "safe-only",
         sop_resume_context: dict[str, Any] | None = None,  # T-AGT-23: SOP 执行恢复上下文
     ) -> AsyncGenerator[AgentEvent, None]:
-        """SOP 轨道：ReactEngine + SOP 导航工具动态注入（T-AGT-22）。
+        """SOP 轨道:ReactEngine + SOP 导航工具动态注入(T-AGT-22).
 
-        核心流程：
-          1. 检测恢复场景：若 sop_resume_context 存在，跳过创建 SopExecution，直接使用恢复信息
-          2. 创建 SopExecution 记录（调用 conversation-service API，仅在非恢复场景）
-          3. 获取 SOP 根节点或当前节点内容（用于构建 system prompt）
-          4. 构建 system prompt（含恢复信息或初始化信息）
-          5. 创建 SopToolExecutor（注入 SOP 工具上下文和 completed_steps）
-          6. 调用 ReactEngine.execute()，动态注入 SOP 工具
+        核心流程:
+          1. 检测恢复场景:若 sop_resume_context 存在,跳过创建 SopExecution,直接使用恢复信息
+          2. 创建 SopExecution 记录(调用 conversation-service API,仅在非恢复场景)
+          3. 获取 SOP 根节点或当前节点内容(用于构建 system prompt)
+          4. 构建 system prompt(含恢复信息或初始化信息)
+          5. 创建 SopToolExecutor(注入 SOP 工具上下文和 completed_steps)
+          6. 调用 ReactEngine.execute(),动态注入 SOP 工具
           7. LLM 可在同一轮中调用诊断工具和 SOP 导航工具
 
         Args:
-            sop_content: SOP 文档内容（Markdown 格式，用于构建初始 prompt）
+            sop_content: SOP 文档内容(Markdown 格式,用于构建初始 prompt)
             sop_title: SOP 文档标题
-            sop_document_id: SOP 文档 ID（用于获取决策树）
+            sop_document_id: SOP 文档 ID(用于获取决策树)
             messages: 对话历史
             category_id: 故障分类编码
             diagnostic_stage: 当前诊断阶段
             ai_client: AI 客户端
             case_id: 工单 ID
             user_id: 用户 ID
-            session_id: 会话 ID（用于创建 SopExecution）
-            sop_resume_context: SOP 执行恢复上下文（T-AGT-23，用于断线重连恢复）
+            session_id: 会话 ID(用于创建 SopExecution)
+            sop_resume_context: SOP 执行恢复上下文(T-AGT-23,用于断线重连恢复)
         """
         # 1. 创建 ConversationSopClient 和 SopToolExecutor
         if not self._conversation_service_url or not self._internal_token:
@@ -886,10 +886,10 @@ class InvestigationAgent(BaseAgent):
         case_id: str,
         user_id: str,
     ) -> AsyncGenerator[AgentEvent, None]:
-        """SOP 轨道降级路径：纯 chat_completion_stream（当 ReactEngine 不可用时）。
+        """SOP 轨道降级路径:纯 chat_completion_stream(当 ReactEngine 不可用时).
 
-        注意：此方法为降级路径，不创建 SopExecution 记录，
-        无法支持中断恢复和 SOP 导航工具。
+        注意:此方法为降级路径,不创建 SopExecution 记录,
+        无法支持中断恢复和 SOP 导航工具.
         """
         system_prompt = await self._build_sop_prompt_legacy(
             sop_content=sop_content,
@@ -927,7 +927,7 @@ class InvestigationAgent(BaseAgent):
         case_id: str,
         user_id: str,
     ) -> AsyncGenerator[AgentEvent, None]:
-        """无知识库匹配时：机制推理降级模式（流式输出）。"""
+        """无知识库匹配时:机制推理降级模式(流式输出)."""
         system_prompt = await self._build_fallback_prompt(
             category_id=category_id,
             diagnostic_stage=diagnostic_stage,
@@ -958,7 +958,7 @@ class InvestigationAgent(BaseAgent):
         case_id: str,
         context_variables: dict | None = None,
     ) -> str:
-        """构建 SOP ReactEngine 模式 System Prompt（数据库化）。"""
+        """构建 SOP ReactEngine 模式 System Prompt(数据库化)."""
         stage_desc_map = {
             "S1": "S1 - 故障定位",
             "S2": "S2 - 假设生成",
@@ -1032,12 +1032,12 @@ class InvestigationAgent(BaseAgent):
 
     @staticmethod
     def _build_root_node_summary(sop_title: str, root_node: dict) -> str:
-        """构建 SOP 根节点摘要（T-AGT-22）。
+        """构建 SOP 根节点摘要(T-AGT-22).
 
-        格式：
-          【根节点：xxx】
+        格式:
+          [根节点:xxx]
           [节点内容摘要]
-          【可选分支】
+          [可选分支]
           - n-1-1: xxx
           - n-1-2: xxx
 
@@ -1107,12 +1107,12 @@ class InvestigationAgent(BaseAgent):
         completed_steps: list[str],
         context_variables: dict,
     ) -> str:
-        """构建 SOP 恢复摘要（T-AGT-23）。
+        """构建 SOP 恢复摘要(T-AGT-23).
 
-        格式（参考 docs/task/agent/events/2026-05-26-SOP执行引擎-M1数据库与M2导航工具化.md）：
-          正在执行 SOP：《VM 启动失败排障》
-          已完成步骤 3 步，当前位置：存储 I/O 故障 → 磁盘检查
-          已知变量：vm_name=prod-vm-001, disk_id=disk-004
+        格式(参考 docs/task/agent/events/2026-05-26-SOP执行引擎-M1数据库与M2导航工具化.md):
+          正在执行 SOP:《VM 启动失败排障》
+          已完成步骤 3 步,当前位置:存储 I/O 故障 → 磁盘检查
+          已知变量:vm_name=prod-vm-001, disk_id=disk-004
 
         Args:
             sop_title: SOP 文档标题
@@ -1146,13 +1146,13 @@ class InvestigationAgent(BaseAgent):
 
     @staticmethod
     def _build_current_node_summary(current_node: dict) -> str:
-        """构建当前节点摘要（T-AGT-23，恢复场景使用）。
+        """构建当前节点摘要(T-AGT-23,恢复场景使用).
 
-        格式：
-          【当前节点：xxx】
-          类型：diagnosis
-          内容摘要：...
-          【可选分支】
+        格式:
+          [当前节点:xxx]
+          类型:diagnosis
+          内容摘要:...
+          [可选分支]
           - n-3-1: xxx
 
         Args:
@@ -1221,7 +1221,7 @@ class InvestigationAgent(BaseAgent):
         diagnostic_stage: str,
         case_id: str,
     ) -> str:
-        """构建 SOP 恢复版 System Prompt（数据库化）。"""
+        """构建 SOP 恢复版 System Prompt(数据库化)."""
         stage_desc_map = {
             "S1": "S1 - 故障定位",
             "S2": "S2 - 假设生成",
@@ -1305,7 +1305,7 @@ class InvestigationAgent(BaseAgent):
 
     @staticmethod
     def _truncate_sop_content(sop_content: str, max_chars: int = 8000) -> str:
-        """截断超长 SOP 内容（降级路径使用）。"""
+        """截断超长 SOP 内容(降级路径使用)."""
         if len(sop_content) > max_chars:
             sop_content = sop_content[:max_chars]
             sop_content += "\n\n[注意：SOP 文档已截断，请基于已有信息分步推理。必要时通过工具获取更多细节]"
@@ -1318,7 +1318,7 @@ class InvestigationAgent(BaseAgent):
         diagnostic_stage: str,
         case_id: str,
     ) -> str:
-        """单元测试兼容性静态方法，不查询数据库，直接格式化默认模板（专门为测试服务）"""
+        """单元测试兼容性静态方法,不查询数据库,直接格式化默认模板(专门为测试服务)"""
         stage_desc_map = {
             "S1": "S1 - 故障定位",
             "S2": "S2 - 假设生成",
@@ -1349,7 +1349,7 @@ class InvestigationAgent(BaseAgent):
         diagnostic_stage: str,
         case_id: str,
     ) -> str:
-        """构建 SOP 模式 System Prompt（数据库化，降级文本路径）。"""
+        """构建 SOP 模式 System Prompt(数据库化,降级文本路径)."""
         stage_desc_map = {
             "S1": "S1 - 故障定位",
             "S2": "S2 - 假设生成",
@@ -1386,7 +1386,7 @@ class InvestigationAgent(BaseAgent):
         diagnostic_stage: str,
         case_id: str,
     ) -> str:
-        """构建机制推理降级 System Prompt（数据库化）。"""
+        """构建机制推理降级 System Prompt(数据库化)."""
         stage_desc_map = {
             "S1": "S1 - 故障定位",
             "S2": "S2 - 假设生成",
@@ -1415,7 +1415,7 @@ class InvestigationAgent(BaseAgent):
 
     @staticmethod
     def _semantic_question_exhausted(messages: list[dict], question: str | None) -> bool:
-        """同一组补充信息最多询问两次，不把模型建议作为用户确认。"""
+        """同一组补充信息最多询问两次,不把模型建议作为用户确认."""
         return (
             bool(question)
             and sum(
@@ -1428,7 +1428,7 @@ class InvestigationAgent(BaseAgent):
 
     @staticmethod
     def _semantic_question_answered(messages: list[dict], question: str | None) -> bool:
-        """从持久化对话判断语义澄清问题是否已有客户事实回答。"""
+        """从持久化对话判断语义澄清问题是否已有客户事实回答."""
 
         if not question:
             return False
@@ -1468,11 +1468,14 @@ class InvestigationAgent(BaseAgent):
 
     @classmethod
     def _evidence_request_satisfied(cls, messages: list[dict], request: str) -> bool:
-        """检测用户消息中是否已提供该 evidence request 要求的信息。
+        """检测用户消息中是否已提供该 evidence request 要求的信息.
 
-        使用字符 bigram 匹配策略：从 request 提取所有相邻字符对，过滤掉纯功能字
-        组合，然后检查用户消息中命中了多少。至少 2 个有意义 bigram 命中才认为
-        用户已提供对应信息。此策略无需中文分词即可覆盖中英文混合场景。
+        使用字符 bigram 匹配策略:从 request 提取所有相邻字符对,过滤掉纯功能字
+        组合,然后检查用户消息中命中了多少.至少 2 个有意义 bigram 命中才认为
+        用户已提供对应信息.此策略无需中文分词即可覆盖中英文混合场景.
+
+        注意:此方法为快速路径,对于复杂场景(如部分信息满足)可能不够准确.
+        更准确的判断请使用 `_evidence_request_satisfied_with_llm`.
         """
 
         user_messages = [
@@ -1485,7 +1488,7 @@ class InvestigationAgent(BaseAgent):
         if not user_messages:
             return False
 
-        # 从 request 提取字符 bigram，过滤纯功能字组合
+        # 从 request 提取字符 bigram,过滤纯功能字组合
         request_lower = request.lower()
         distinctive_bigrams = set()
         for i in range(len(request_lower) - 1):
@@ -1497,21 +1500,122 @@ class InvestigationAgent(BaseAgent):
         if not distinctive_bigrams:
             return False
 
-        # 合并所有用户消息，按请求自身的特征片段覆盖率判断。固定“命中 2 个”会
-        # 让只出现一个短词（例如 ISO）的原始描述误满足包含多项证据的请求。
+        # 合并所有用户消息,按请求自身的特征片段覆盖率判断.固定"命中 2 个"会
+        # 让只出现一个短词(例如 ISO)的原始描述误满足包含多项证据的请求.
         combined = " ".join(user_messages).lower()
         matched = sum(1 for bg in distinctive_bigrams if bg in combined)
         required_matches = max(2, (len(distinctive_bigrams) * 2 + 4) // 5)
         return matched >= required_matches
 
-    @classmethod
-    def _semantic_guidance_messages(cls, messages: list[dict], semantic_result: dict) -> list[str]:
-        """构造下一轮人工补证据文本，避免重复提问或混入 CDD 报告。"""
+    async def _evidence_request_satisfied_with_llm(
+        self,
+        messages: list[dict],
+        request: str,
+        assistant_type: str = "htp-agent",
+    ) -> bool:
+        """使用 LLM 判断用户消息中是否已提供该 evidence request 要求的信息.
+
+        相比 bigram 匹配,此方法能理解语义相似性和部分信息满足的场景.
+        例如:用户回答"微软官方原版 ISO"可以满足"请提供 ISO 文件名和来源"的请求.
+
+        Args:
+            messages: 对话消息列表
+            request: evidence request 文本
+            assistant_type: 助手类型,用于获取对应的 AI 客户端
+
+        Returns:
+            True 如果用户已提供足够的信息,False 否则
+        """
+        user_messages = [
+            str(m.get("content") or "").strip()
+            for m in messages
+            if m.get("role") == "user"
+            and str(m.get("content") or "").strip()
+            and not _RETRIEVAL_CONTROL_RE.fullmatch(str(m.get("content") or "").strip())
+        ]
+        if not user_messages:
+            return False
+
+        user_text = "\n".join(f"- {msg}" for msg in user_messages)
+
+        # 构建 LLM 判断 prompt
+        prompt = f"""请判断用户是否已提供以下证据请求要求的信息.
+
+[证据请求]
+{request}
+
+[用户提供的信息]
+{user_text}
+
+[判断标准]
+1. 用户是否提供了证据请求要求的核心信息?
+2. 如果证据请求包含多项要求(如"文件名,SHA1,大小"),用户是否至少提供了主要部分?
+3. 用户提供的信息是否与请求的语义相关,即使是替代表述?
+
+[示例]
+- 请求"请提供 ISO 文件名和来源",用户回答"微软官方原版 ISO" → YES(提供了来源)
+- 请求"请确认磁盘控制器类型",用户回答"virtio" → YES(提供了控制器类型)
+- 请求"请提供 ISO 文件名,SHA1 和大小",用户只回答"官方原版" → NO(只提供了来源,缺少文件名等)
+
+请只回答 YES 或 NO,不要解释."""
+
+        try:
+            ai_client = self._ai_registry.get_client(assistant_type)
+            if not ai_client:
+                logger.warning(
+                    event="llm_evidence_check_fallback",
+                    reason="ai_client_not_found",
+                    assistant_type=assistant_type,
+                )
+                # 降级到 bigram 匹配
+                return self._evidence_request_satisfied(messages, request)
+
+            response = await ai_client.invoke(
+                messages=[
+                    {"role": "system", "content": "你是一个精确的信息判断助手.请根据用户提供的信息判断是否满足证据请求.只回答 YES 或 NO."},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.0,  # 确保确定性输出
+                max_tokens=10,  # 只需要 YES/NO
+            )
+
+            answer = (response.content or "").strip().upper()
+            satisfied = "YES" in answer
+
+            logger.info(
+                event="llm_evidence_check_result",
+                request=request[:100],
+                user_message_count=len(user_messages),
+                satisfied=satisfied,
+                llm_answer=answer[:10],
+            )
+
+            return satisfied
+
+        except Exception as exc:
+            logger.warning(
+                event="llm_evidence_check_failed",
+                error=str(exc),
+                request=request[:100],
+            )
+            # 降级到 bigram 匹配
+            return self._evidence_request_satisfied(messages, request)
+
+    async def _semantic_guidance_messages(
+        self,
+        messages: list[dict],
+        semantic_result: dict,
+        assistant_type: str = "htp-agent",
+    ) -> list[str]:
+        """Construct next round of manual evidence request text.
+        
+        Uses LLM to judge if user has provided the information requested by evidence requests.
+        """
 
         question = str((semantic_result.get("next_action") or {}).get("question") or "").strip()
-        question_answered = cls._semantic_question_answered(messages, question)
-        if not question_answered and cls._semantic_question_exhausted(messages, question):
-            return ["补充信息后仍无法安全区分候选，已请求人工复核。"]
+        question_answered = self._semantic_question_answered(messages, question)
+        if not question_answered and self._semantic_question_exhausted(messages, question):
+            return ["补充信息后仍无法安全区分候选,已请求人工复核."]
 
         outputs: list[str] = []
         matched_cases = [
@@ -1520,26 +1624,34 @@ class InvestigationAgent(BaseAgent):
             if item.get("support_id") or item.get("kbd_id")
         ]
         if matched_cases:
-            outputs.append("🔎 已命中语义案例：" + "；".join(dict.fromkeys(matched_cases)) + "。当前仅提供补证据指引，尚未确认根因。")
+            outputs.append("🔎 已命中语义案例:" + ";".join(dict.fromkeys(matched_cases)) + ".当前仅提供补证据指引,尚未确认根因.")
         if question and not question_answered:
-            outputs.append("目前无法确认根因。" + question)
-        # 过滤用户已提供的 evidence request，避免重复索要已知信息
-        requests = [
+            outputs.append("目前无法确认根因." + question)
+
+        # 使用 LLM 过滤用户已提供的 evidence request,避免重复索要已知信息
+        all_requests = [
             request.strip()
             for item in semantic_result.get("candidates") or []
             for request in (item.get("manual_evidence_request") or [])
             if isinstance(request, str) and request.strip()
-            and not cls._evidence_request_satisfied(messages, request.strip())
         ]
-        if requests:
-            outputs.append("当前只能请求补充证据：" + "；".join(dict.fromkeys(requests)))
+
+        # 并行检查所有 evidence requests
+        unsatisfied_requests = []
+        for request in all_requests:
+            satisfied = await self._evidence_request_satisfied_with_llm(messages, request, assistant_type)
+            if not satisfied:
+                unsatisfied_requests.append(request)
+
+        if unsatisfied_requests:
+            outputs.append("当前只能请求补充证据:" + ";".join(dict.fromkeys(unsatisfied_requests)))
         return outputs
 
     @staticmethod
     def _semantic_guidance_pending(messages: list[dict]) -> bool:
-        """检测上一轮已发出补证据请求且客户随后提供了新事实。"""
+        """Check if previous round requested evidence and user provided new facts."""
 
-        marker = "当前只能请求补充证据："
+        marker = "当前只能请求补充证据:"
         marker_index = max(
             (
                 index
@@ -1581,7 +1693,7 @@ class InvestigationAgent(BaseAgent):
         description = "\n".join(values)
         if len(description) > 16000:
             description = description[:8000] + "\n" + description[-7999:]
-        # 只透传环境已知字段；不从语义推导目标或版本。
+        # 只透传环境已知字段;不从语义推导目标或版本.
         return {
             "description": description,
             **{
@@ -1601,8 +1713,8 @@ class InvestigationAgent(BaseAgent):
           而非有语义的症状描述。用它做检索 query 等同随机搜索。
         - 取正序第一条有效用户消息（初始主诉）是最接近真实症状的文本。
         """
-        # S0 控制符模式：菜单选项编号 / 单字确认词
-        for msg in messages:  # 正序，找第一条有效 user 消息
+        # S0 控制符模式:菜单选项编号 / 单字确认词
+        for msg in messages:  # 正序,找第一条有效 user 消息
             if msg.get("role") == "user" and isinstance(msg.get("content"), str):
                 txt = msg["content"].strip()
                 if txt and not _RETRIEVAL_CONTROL_RE.fullmatch(txt):
