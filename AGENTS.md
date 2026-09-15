@@ -30,6 +30,14 @@
     - 新增 `_evidence_request_satisfied()` 方法，使用字符 bigram 匹配策略（无需中文分词）检测用户消息中是否已包含 evidence request 要求的信息；`_semantic_guidance_messages()` 过滤掉已满足的请求项。
     - 新增循环中断机制：快捷路径中统计 guidance marker 出现次数，≥3 轮用户补充后仍无法推进时，输出确认收到 + 建议转人工的消息，不再重复请求。
   - **测试守护**：新增 4 个单元测试覆盖 bigram 匹配、已提供过滤、无关消息不误判等场景。
+- **LLM 证据满足判断**：
+  - **根因**：bigram 匹配策略无法理解语义相似性。例如用户回答"微软官方原版 ISO"无法满足"请提供 ISO 文件名、SHA1 和文件大小"的请求，因为 bigram 匹配只能识别字面重叠，无法理解"官方原版"是对"来源"的部分满足。导致系统反复索要用户可能无法提供的技术细节（如 SHA1）。
+  - **修复**：
+    - 新增 `_evidence_request_satisfied_with_llm()` 异步方法，调用 LLM 判断用户消息是否满足证据请求。使用温度 0.0 确保确定性输出，失败时降级到 bigram 匹配。
+    - 将 `_semantic_guidance_messages()` 改为异步方法，使用 LLM 并行过滤所有 evidence requests。
+    - 更新两个调用点使用 `await`。
+  - **优势**：能理解语义相似性（如"官方原版"满足"来源"需求）、能判断部分信息满足场景、无需硬编码关键词规则。
+  - **测试守护**：更新测试用例适配新的异步接口，562 个测试全部通过。
 - **Langfuse 子路径导航丢失修复（NEXT_PUBLIC_BASE_PATH 补齐）**（PR #1035）：
   - **根因**：Langfuse (Next.js) 通过 Traefik `stripPrefix` 中间件挂载在 `/langfuse` 子路径，但容器内未配置 `NEXT_PUBLIC_BASE_PATH`，导致 Next.js 前端生成的内部链接（页面跳转、tRPC 请求）不含 `/langfuse` 前缀。首页直接访问 `/langfuse` 能命中 Ingress 规则，但点击项目/设置等页面后，浏览器 URL 变为 `/project/xxx` 或 `/api/trpc/...`，脱离 Ingress 路由范围导致导航丢失。
   - **修复**：在 `deploy/helm/hci-platform-obs/templates/langfuse.yaml` 的 `langfuse-server` 环境变量中增加 `NEXT_PUBLIC_BASE_PATH=/langfuse`（subdomain 模式下不设置），使 Next.js 前端生成的内部链接（页面跳转、静态资源、tRPC 请求）自动带 `/langfuse` 前缀。**注意**：Next.js `basePath` 不影响 `/api/` 路由，健康端点始终在 `/api/public/health`，探针路径保持不变。Docker Compose 无需修改（本地 `localhost:13000` 无子路径前缀）。
