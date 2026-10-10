@@ -9,7 +9,7 @@ import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import { OutputProcessingEditor, QfkProcessingEditor, SignalDryRunDialog } from '@/components/editors'
 import SemanticProfileEditor from '@/components/editors/SemanticProfileEditor.vue'
-import type { SignalV2, SignalsDoc, ChangeAnnotation } from '@/utils/kbdSignalTypes'
+import type { SignalV2, SignalsDoc, ChangeAnnotation, RejectedCandidateItem } from '@/utils/kbdSignalTypes'
 import { generateUUID } from '@hci/shared'
 import {
   buildProduceVariableCatalog,
@@ -857,9 +857,19 @@ function buildSignalRequestError(responseBody: any, statusCode: number, headers?
   return error
 }
 
+async function focusRejectedCandidatesPanel(): Promise<void> {
+  await nextTick()
+  document.querySelector('.rejected-candidates')?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+}
+
 async function handleReviewAction(issue: SignalReviewResponse['issues'][number]) {
   const signalId = issue.action?.signal_id
   if (!signalId) {
+    if (issue.action?.type === 'review_rejected_candidates') {
+      await focusRejectedCandidatesPanel()
+      ElMessage.info('请逐条复核被拒候选：恢复并修正为有效信号，或填写处置说明标记「已复核忽略」')
+      return
+    }
     if (issue.action?.type === 'edit_signal_role' && signalList.value.length) {
       startEditSignal(0)
       await focusSignal(signalStableId(signalList.value[0], 0))
@@ -2984,7 +2994,7 @@ const signalGenerationMetadata = computed<Record<string, any>>(
 const expertSignalEditSummary = computed(
   () => revisionState.value?.expert_signal_edit_summary,
 )
-const rejectedSignalCandidates = computed(
+const rejectedSignalCandidates = computed<RejectedCandidateItem[]>(
   () => (detailEntry.value?.signals_json as SignalsDoc | undefined)?.rejected_candidates || [],
 )
 const rejectedCandidateMeta = {
@@ -3003,7 +3013,40 @@ const rejectedCandidateMeta = {
     tagType: 'danger',
     guidance: '必须重点处理：catalog 已登记也不代表可运行，请依据具体失败原因修正。',
   },
+  tool_restricted: {
+    label: '工具受限',
+    tagType: 'warning',
+    guidance: '该候选使用受限工具（如 qfk_var 自由文本命令），已被抽取管道剥离；如需保留请改用受控采集工具重建。',
+  },
 } as const
+
+// ── 被拒候选专家处置（复核忽略 / 撤销处置）────────────────────────────────────
+// 处置是服务端单对象操作（V-007）：只携带稳定候选 ID + 说明 + 操作人，不夹带
+// 本地未保存的信号草稿；审计快照（candidate/reason）由服务端原样保留。
+function rejectedCandidateStableId(item: RejectedCandidateItem): string {
+  const candidate = item?.candidate as { id?: unknown } | undefined
+  return String(candidate?.id ?? '').trim()
+}
+
+function rejectedCandidateDismissal(item: RejectedCandidateItem) {
+  const dismissal = item?.expert_dismissal
+  if (!dismissal || typeof dismissal !== 'object') return null
+  return dismissal
+}
+
+function rejectedCandidateDismissalTime(item: RejectedCandidateItem): string {
+  const dismissal = rejectedCandidateDismissal(item)
+  if (!dismissal?.reviewed_at) return ''
+  const parsed = new Date(dismissal.reviewed_at)
+  return Number.isNaN(parsed.getTime()) ? String(dismissal.reviewed_at) : parsed.toLocaleString()
+}
+
+const pendingRejectedCandidates = computed(() =>
+  rejectedSignalCandidates.value.filter((item) => !rejectedCandidateDismissal(item)),
+)
+const allRejectedCandidatesDismissed = computed(
+  () => rejectedSignalCandidates.value.length > 0 && pendingRejectedCandidates.value.length === 0,
+)
 
 function rejectedCandidatePresentation(reasonCode?: string) {
   return rejectedCandidateMeta[reasonCode as keyof typeof rejectedCandidateMeta] || {
@@ -3729,6 +3772,167 @@ function restoreRejectedCandidate(candidate: unknown) {
   markLocalSignal(String(restored.id))
   startEditSignal(doc.signals.length - 1)
   ElMessage.info('候选已恢复为编辑草稿，请复核并保存')
+}
+
+// ── 被拒候选处置提交链路（复核忽略 / 撤销处置 / 全部复核忽略）──────────────────
+const dismissRejectedDialogVisible = ref(false)
+const dismissRejectedCandidateId = ref('')
+const dismissRejectedNote = ref('')
+const dismissRejectedLoading = ref(false)
+
+/** 处置 PATCH 共用链路：服务端按稳定候选 ID 作用于权威工作稿，成功后同步本地文档与审查。 */
+async function patchRejectedDisposal(bodyExtra: Record<string, unknown>, successMessage: string): Promise<void> {
+  if (!detailEntry.value) return
+  const resp = await fetch(kbdEditEndpoint(detailEntry.value), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', ...authHeader },
+    body: JSON.stringify({
+      ...bodyExtra,
+      lock_version: detailEntry.value.lock_version,
+    }),
+  })
+  const responseBody = await resp.json().catch(() => ({}))
+  if (!resp.ok) {
+    throw buildSignalRequestError(responseBody, resp.status, resp.headers)
+  }
+  applyMaintenanceResponse(detailEntry.value, responseBody)
+  const serverDoc = (responseBody?.payload?.signals_json || responseBody?.signals_json) as SignalsDoc | undefined
+  if (serverDoc) {
+    detailEntry.value.signals_json = serverDoc
+    const entryIndex = entries.value.findIndex((entry) => entry.id === detailEntry.value!.id)
+    if (entryIndex !== -1) entries.value[entryIndex].signals_json = serverDoc
+  }
+  detailEntry.value.lock_version = responseBody?.lock_version ?? detailEntry.value.lock_version
+  void fetchRevisionState(detailEntry.value.id)
+  await reviewCurrentSignals({ silent: true })
+  if (successMessage) ElMessage.success(successMessage)
+}
+
+function openDismissRejectedDialog(item: RejectedCandidateItem) {
+  const candidateId = rejectedCandidateStableId(item)
+  if (!candidateId) {
+    ElMessage.error({
+      message: '该被拒候选缺少稳定候选 ID，无法处置；请重新抽取生成新候选后再处理',
+      duration: 0,
+      showClose: true,
+    })
+    return
+  }
+  dismissRejectedCandidateId.value = candidateId
+  dismissRejectedNote.value = ''
+  dismissRejectedDialogVisible.value = true
+}
+
+async function submitDismissRejectedCandidate() {
+  const note = dismissRejectedNote.value.trim()
+  if (!note) {
+    ElMessage.warning('请填写处置说明（复核忽略的理由，供审计与后续评估）')
+    return
+  }
+  const reviewerId = await ensureReviewerIdentity()
+  if (reviewerId === null) return
+  dismissRejectedLoading.value = true
+  try {
+    await patchRejectedDisposal(
+      {
+        dismiss_rejected_candidate_id: dismissRejectedCandidateId.value,
+        dismiss_rejected_note: note,
+        reviewer_id: reviewerId,
+        change_annotations: [
+          { path: '/signals_json/rejected_candidates', reason_code: 'rejected_candidate_dismissed', note } satisfies ChangeAnnotation,
+        ],
+      },
+      '被拒候选已标记为「已复核忽略」',
+    )
+    dismissRejectedDialogVisible.value = false
+    dismissRejectedCandidateId.value = ''
+  } catch (error) {
+    await focusSignalRequestError(error)
+    ElMessage.error(error instanceof Error ? `处置失败：${error.message}` : '处置失败，请重试')
+  } finally {
+    dismissRejectedLoading.value = false
+  }
+}
+
+async function revokeRejectedDismissal(item: RejectedCandidateItem) {
+  const candidateId = rejectedCandidateStableId(item)
+  if (!candidateId || !detailEntry.value) return
+  try {
+    await ElMessageBox.confirm(
+      '撤销后该被拒候选恢复为「未复核」状态；若案例当前无关键信号，发布将重新被门禁拦截。确认撤销？',
+      '撤销复核忽略',
+      { type: 'warning', confirmButtonText: '撤销处置', cancelButtonText: '取消' },
+    )
+  } catch {
+    return
+  }
+  try {
+    await patchRejectedDisposal(
+      {
+        revoke_rejected_candidate_id: candidateId,
+        change_annotations: [
+          { path: '/signals_json/rejected_candidates', reason_code: 'rejected_candidate_dismissal_revoked' } satisfies ChangeAnnotation,
+        ],
+      },
+      '处置记录已撤销，候选恢复为未复核',
+    )
+  } catch (error) {
+    await focusSignalRequestError(error)
+    ElMessage.error(error instanceof Error ? `撤销失败：${error.message}` : '撤销失败，请重试')
+  }
+}
+
+async function dismissAllRejectedCandidates() {
+  const pendingIds = pendingRejectedCandidates.value.map(rejectedCandidateStableId).filter(Boolean)
+  if (!pendingIds.length) return
+  let note = ''
+  try {
+    const result = await ElMessageBox.prompt(
+      `将把 ${pendingIds.length} 条未复核的被拒候选全部标记为「已复核忽略」。全部处置后，无信号案例即可按「仅案例推荐」发布；重新抽取会重置处置状态。请填写统一的处置说明：`,
+      '全部复核忽略',
+      {
+        confirmButtonText: '确认处置',
+        cancelButtonText: '取消',
+        inputType: 'textarea',
+        inputValidator: (value: string) => (value && value.trim() ? true : '处置说明不能为空'),
+        inputPlaceholder: '例如：案例确认为纯文本知识，候选均无恢复价值',
+      },
+    )
+    note = String(result.value || '').trim()
+  } catch {
+    return
+  }
+  const reviewerId = await ensureReviewerIdentity()
+  if (reviewerId === null) return
+  dismissRejectedLoading.value = true
+  let done = 0
+  try {
+    // 串行提交：每次响应会刷新 lock_version，避免并发乐观锁互踩（V-007 单对象语义）。
+    for (const candidateId of pendingIds) {
+      await patchRejectedDisposal(
+        {
+          dismiss_rejected_candidate_id: candidateId,
+          dismiss_rejected_note: note,
+          reviewer_id: reviewerId,
+          change_annotations: [
+            { path: '/signals_json/rejected_candidates', reason_code: 'rejected_candidate_dismissed', note } satisfies ChangeAnnotation,
+          ],
+        },
+        '',
+      )
+      done += 1
+    }
+    ElMessage.success(`已复核忽略 ${done} 条被拒候选`)
+  } catch (error) {
+    await focusSignalRequestError(error)
+    ElMessage.error(
+      error instanceof Error
+        ? `已处置 ${done}/${pendingIds.length} 条，中断于：${error.message}`
+        : `已处置 ${done}/${pendingIds.length} 条，请刷新后重试`,
+    )
+  } finally {
+    dismissRejectedLoading.value = false
+  }
 }
 
 async function saveSignalEdit() {
@@ -5316,6 +5520,12 @@ onUnmounted(() => clearBatchPollTimer())
                 size="small"
                 @click="handleReviewAction(issue)"
               >定位并编辑</el-button>
+              <el-button
+                v-else-if="issue.action?.type === 'review_rejected_candidates'"
+                type="primary"
+                size="small"
+                @click="handleReviewAction(issue)"
+              >定位并处理</el-button>
             </div>
           </div>
         </div>
@@ -5571,18 +5781,37 @@ onUnmounted(() => clearBatchPollTimer())
           </details>
           <el-alert
             v-if="rejectedSignalCandidates.length > 0"
-            type="warning"
+            :type="allRejectedCandidatesDismissed ? 'success' : 'warning'"
             :closable="false"
             show-icon
-            :title="`本轮有 ${rejectedSignalCandidates.length} 条候选未通过工程门禁，已保留原始候选与拒绝原因供复核。`"
+            :title="allRejectedCandidatesDismissed
+              ? `本轮 ${rejectedSignalCandidates.length} 条被拒候选均已复核处置；无信号案例现可按「仅案例推荐」发布。`
+              : `本轮有 ${rejectedSignalCandidates.length} 条候选未通过工程门禁（其中 ${pendingRejectedCandidates.length} 条待复核）。请逐条「恢复并编辑」修正为有效信号，或填写处置说明标记「已复核忽略」；全部处理后，无信号案例才能按「仅案例推荐」发布。重新抽取会重置处置状态。`"
           />
+          <div v-if="pendingRejectedCandidates.length > 1" class="rejected-candidates-bulk">
+            <el-button
+              type="warning"
+              plain
+              size="small"
+              :disabled="!canEditCurrent"
+              :loading="dismissRejectedLoading"
+              @click="dismissAllRejectedCandidates"
+            >全部复核忽略（{{ pendingRejectedCandidates.length }} 条待处理）</el-button>
+          </div>
           <el-collapse v-if="rejectedSignalCandidates.length > 0" class="rejected-candidates">
             <el-collapse-item
               v-for="(item, index) in rejectedSignalCandidates"
-              :key="`rejected-${index}`"
-              :title="`拒绝候选 ${index + 1}`"
-              :name="`rejected-${index}`"
+              :key="`rejected-${rejectedCandidateStableId(item) || index}`"
+              :name="`rejected-${rejectedCandidateStableId(item) || index}`"
             >
+              <template #title>
+                <span class="rejected-candidate-title">
+                  拒绝候选 {{ index + 1 }}
+                  <span v-if="rejectedCandidateStableId(item)" class="rejected-candidate-id">{{ rejectedCandidateStableId(item) }}</span>
+                  <el-tag v-if="rejectedCandidateDismissal(item)" size="small" type="success">已复核忽略</el-tag>
+                  <el-tag v-else size="small" type="warning">待复核</el-tag>
+                </span>
+              </template>
               <div class="rejected-candidate-reason">
                 <el-tag
                   size="small"
@@ -5591,8 +5820,30 @@ onUnmounted(() => clearBatchPollTimer())
                 <strong>{{ item.reason }}</strong>
               </div>
               <div class="field-hint">{{ rejectedCandidatePresentation(item.reason_code).guidance }}</div>
+              <div v-if="rejectedCandidateDismissal(item)" class="rejected-candidate-dismissal">
+                <el-tag size="small" type="success">已复核忽略</el-tag>
+                <span>操作人 {{ rejectedCandidateDismissal(item)!.reviewed_by }} · {{ rejectedCandidateDismissalTime(item) }}</span>
+                <div class="field-hint">处置说明：{{ rejectedCandidateDismissal(item)!.note }}</div>
+              </div>
               <pre class="code rejected-candidate-json">{{ JSON.stringify(item.candidate, null, 2) }}</pre>
-              <el-button type="primary" size="small" @click="restoreRejectedCandidate(item.candidate)">恢复并编辑</el-button>
+              <div class="rejected-candidate-actions">
+                <el-button type="primary" size="small" @click="restoreRejectedCandidate(item.candidate)">恢复并编辑</el-button>
+                <el-button
+                  v-if="!rejectedCandidateDismissal(item)"
+                  type="warning"
+                  size="small"
+                  :disabled="!canEditCurrent"
+                  @click="openDismissRejectedDialog(item)"
+                >复核忽略</el-button>
+                <el-button
+                  v-else
+                  type="info"
+                  text
+                  size="small"
+                  :disabled="!canEditCurrent"
+                  @click="revokeRejectedDismissal(item)"
+                >撤销处置</el-button>
+              </div>
             </el-collapse-item>
           </el-collapse>
 
@@ -7067,6 +7318,37 @@ onUnmounted(() => clearBatchPollTimer())
       </template>
     </el-dialog>
 
+    <!-- 被拒候选复核忽略（专家显式处置，2026-10-10）：审计快照保留，处置记录落 expert_dismissal -->
+    <el-dialog v-model="dismissRejectedDialogVisible" title="复核忽略被拒候选" width="560px" :close-on-click-modal="false">
+      <el-alert type="warning" :closable="false" show-icon style="margin-bottom: 12px;">
+        <template #title>
+          正在处置被拒候选 <code>{{ dismissRejectedCandidateId }}</code>。候选快照与拒绝原因将原样保留供审计；
+          全部候选处置后，无信号案例可按「仅案例推荐」发布并参与客户侧标题推荐。重新抽取会重置处置状态。
+        </template>
+      </el-alert>
+      <el-form label-position="top">
+        <el-form-item label="处置说明" required>
+          <el-input
+            v-model="dismissRejectedNote"
+            type="textarea"
+            :rows="3"
+            maxlength="500"
+            show-word-limit
+            placeholder="必填：说明为何放弃该候选。例如：原文步骤为人工操作指引，无法建模为受控采集信号，案例按纯文本知识保留。"
+          />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dismissRejectedDialogVisible = false">取消</el-button>
+        <el-button
+          type="warning"
+          :disabled="!dismissRejectedNote.trim()"
+          :loading="dismissRejectedLoading"
+          @click="submitDismissRejectedCandidate"
+        >确认已复核忽略</el-button>
+      </template>
+    </el-dialog>
+
     <!-- 关键信号 JSON 导入（2026-08-17）：仅追加语义，导入信号统一 needs_review 待复核 -->
     <el-dialog v-model="importSignalsDialogVisible" title="导入关键信号（JSON）" width="720px" :close-on-click-modal="false">
       <el-alert type="info" :closable="false" style="margin-bottom: 12px;">
@@ -8175,6 +8457,37 @@ onUnmounted(() => clearBatchPollTimer())
 }
 .rejected-candidate-reason strong {
   line-height: 24px;
+}
+.rejected-candidates-bulk {
+  margin: 8px 0;
+}
+.rejected-candidate-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.rejected-candidate-id {
+  font-family: var(--el-font-family-mono, monospace);
+  font-size: 12px;
+  color: #909399;
+}
+.rejected-candidate-dismissal {
+  margin: 6px 0;
+  padding: 6px 8px;
+  border: 1px solid #e1f3d8;
+  border-radius: 5px;
+  background: #f0f9eb;
+  color: #606266;
+  font-size: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.rejected-candidate-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 8px;
 }
 .signal-evidence-details,
 .signal-advanced-details {

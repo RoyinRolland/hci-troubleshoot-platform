@@ -235,6 +235,87 @@ async def test_signal_review_is_side_effect_free_and_separates_contract_from_run
     session.commit.assert_not_awaited()
 
 
+def _review_kbd_namespace(signals_json):
+    return SimpleNamespace(
+        id=9,
+        title="跨集群迁移端口连通性",
+        problem_description="迁移失败",
+        root_cause="端口不通",
+        solution="放通端口",
+        alert_info="",
+        steps_text="telnet 测试端口",
+        category_id="net-001",
+        ai_category_id=None,
+        status="draft",
+        working_revision_id=None,
+        lock_version=3,
+        images_json=[],
+        signals_json=signals_json,
+    )
+
+
+@pytest.mark.asyncio
+async def test_signal_review_reports_unresolved_rejected_candidates_as_actionable_issue():
+    """空信号 + 未处置被拒候选：审查给出可执行的 KBD_REJECTED_CANDIDATES_UNRESOLVED。"""
+    session = AsyncMock()
+    session.get.return_value = _review_kbd_namespace(
+        {
+            "schema_version": 2,
+            "signals": [],
+            "rejected_candidates": [
+                {"candidate": {"id": "sig_002"}, "reason_code": "run_failed", "reason": "keyword 不可追溯"}
+            ],
+        }
+    )
+    db = _db_with_session(session)
+    with patch.object(admin_route, "_check_auth"), patch.object(admin_route, "_db_manager", db):
+        body = await admin_route.review_kbd_signals(MagicMock(), 9)
+
+    assert body["publishable"] is False
+    codes = [issue["code"] for issue in body["issues"]]
+    assert "KBD_REJECTED_CANDIDATES_UNRESOLVED" in codes
+    rejected_issue = next(i for i in body["issues"] if i["code"] == "KBD_REJECTED_CANDIDATES_UNRESOLVED")
+    assert rejected_issue["action"] == {"type": "review_rejected_candidates"}
+    assert rejected_issue["field_path"] == "rejected_candidates"
+    # 不得把未处置状态伪装成“可发布为仅案例推荐”
+    assert "KBD_REFERENCE_ONLY" not in [item["code"] for item in body["platform_status"]]
+    session.commit.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_signal_review_passes_reference_only_after_all_rejected_candidates_dismissed():
+    """空信号 + 全部被拒候选已复核忽略：审查放行并给出 KBD_REFERENCE_ONLY 平台状态。"""
+    session = AsyncMock()
+    session.get.return_value = _review_kbd_namespace(
+        {
+            "schema_version": 2,
+            "signals": [],
+            "rejected_candidates": [
+                {
+                    "candidate": {"id": "sig_002"},
+                    "reason_code": "run_failed",
+                    "reason": "keyword 不可追溯",
+                    "expert_dismissal": {
+                        "reviewed_by": "42",
+                        "reviewed_at": "2026-10-10T08:00:00+00:00",
+                        "note": "案例确认为纯文本知识",
+                    },
+                }
+            ],
+        }
+    )
+    db = _db_with_session(session)
+    with patch.object(admin_route, "_check_auth"), patch.object(admin_route, "_db_manager", db):
+        body = await admin_route.review_kbd_signals(MagicMock(), 9)
+
+    assert body["publishable"] is True
+    assert "KBD_REJECTED_CANDIDATES_UNRESOLVED" not in [issue["code"] for issue in body["issues"]]
+    assert "KBD_REFERENCE_ONLY" in [item["code"] for item in body["platform_status"]]
+    reference_status = next(item for item in body["platform_status"] if item["code"] == "KBD_REFERENCE_ONLY")
+    assert reference_status["blocks_publish"] is False
+    session.commit.assert_not_awaited()
+
+
 async def test_approval_freezes_a_distinct_expert_revision_even_when_payload_is_unchanged():
     session = AsyncMock()
     # 审批冻结现在同时记录结构化 review metadata，因此测试替身也必须具备完整

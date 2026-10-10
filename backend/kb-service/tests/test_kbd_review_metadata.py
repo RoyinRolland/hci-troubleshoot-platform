@@ -121,3 +121,60 @@ def test_capability_gap_is_engineering_data_not_expert_todo():
         ("qkv_task", "CAPABILITY_RUNTIME_UNVERIFIED", "sig_known"),
         ("filesystem.count_entries", "CAPABILITY_UNDECLARED", "sig_unknown"),
     }
+
+
+def test_rejected_candidate_dismissal_annotation_matches_payload_diff():
+    """处置标注 path 必须命中 payload 根 diff 路径，reason_counts 落受控码而非推断码。
+
+    回归：曾误用 '/rejected_candidates' 作标注 path，而 revision diff 路径以
+    payload 为根（/signals_json/rejected_candidates/N/expert_dismissal），前缀
+    匹配失败导致 reason_counts 落入 other_expert_correction，处置事实无法统计。
+    """
+    from app.routes.admin import KbdUpdateRequest, _rejected_disposal_annotation
+
+    base_signals = {
+        "schema_version": 2,
+        "signals": [],
+        "rejected_candidates": [
+            {"candidate": {"id": "sig_002"}, "reason": "keyword 不可追溯", "reason_code": "run_failed"}
+        ],
+    }
+    dismissed_signals = {
+        "schema_version": 2,
+        "signals": [],
+        "rejected_candidates": [
+            {
+                "candidate": {"id": "sig_002"},
+                "reason": "keyword 不可追溯",
+                "reason_code": "run_failed",
+                "expert_dismissal": {
+                    "reviewed_by": "42",
+                    "reviewed_at": "2026-10-10T08:00:00+00:00",
+                    "note": "确认为纯文本知识",
+                },
+            }
+        ],
+    }
+    before = {"title": "跨集群迁移", "signals_json": base_signals, "payload_schema_version": 1}
+    after = {"title": "跨集群迁移", "signals_json": dismissed_signals, "payload_schema_version": 1}
+
+    body = KbdUpdateRequest(
+        dismiss_rejected_candidate_id="sig_002",
+        dismiss_rejected_note="确认为纯文本知识",
+        reviewer_id=42,
+    )
+    annotations = normalize_change_annotations(_rejected_disposal_annotation(body, []))
+    assert annotations[0]["reason_code"] == "rejected_candidate_dismissed"
+
+    metadata = build_review_metadata(
+        parent_payload=before,
+        payload=after,
+        annotations=annotations,
+        identity_status="unverified_body_reviewer_id",
+        review_state="working",
+    )
+    counts = metadata["change_summary"]["reason_counts"]
+    changes = metadata["change_summary"]["changes"]
+    assert changes, "处置必须产生字段级差异"
+    assert set(counts) == {"rejected_candidate_dismissed"}, counts
+    assert all(change["reason_source"] == "expert" for change in changes)

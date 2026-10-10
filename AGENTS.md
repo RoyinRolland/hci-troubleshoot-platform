@@ -22,6 +22,17 @@
 **HCI 智能排障平台** — AI 驱动的超融合基础设施运维故障诊断系统。
 
 - 用户创建工单描述故障 → AI 助手多轮对话引导排障 → 建议命令和操作步骤 → 形成可复用知识库
+- **KBD 被拒候选专家复核处置出口（无信号案例降级"仅案例推荐"死锁修复）**：
+  - **根因**：专家删光 KBD 全部信号后，若 `signals_json.rejected_candidates` 残留 AI 抽取被拒候选（staging 案例 43596 残留 3 条），`is_reference_only` 判定文档不"干净"，发布门禁报"无信号案例存在未处理的抽取异常或拒绝候选，请先复核；不能自动降级为案例推荐"。设计文档要求"未处理的拒绝候选仍须明确复核"，但平台只有「恢复并编辑」动作（审计快照保留不清除），全代码库无任何处置/清除出口，专家有意降级为纯文本案例推荐时死锁；门禁报错还落入"请按该原因修正后再保存"兜底文案，无可执行动作提示。
+  - **修复**：
+    - **契约层**：`rejectedCandidate` Schema 新增可选 `expert_dismissal`（reviewed_by/reviewed_at/note 全必填，gen-schemas.py 生成）；顺带修复 `reason_code` enum 缺失 `tool_restricted` 导致 qfk_var 剥离文档校验必炸的既有 bug；
+    - **判定层**：`is_reference_only` 改为"全部被拒候选带合规处置记录才放行"，畸形项 fail-closed（`knowledge_capability.py`）；
+    - **服务层**：KBD draft/maintenance PATCH 新增 `dismiss_rejected_candidate_id`（需 note+reviewer_id）/`revoke_rejected_candidate_id` 单对象分支（镜像 `delete_signal_id`，按稳定 `candidate.id` 定位，404/422/409 fail-closed，V-007 不夹带整稿）；审计三件套：`expert_dismissal` 落文档 + 受控原因码 `rejected_candidate_dismissed`/`rejected_candidate_dismissal_revoked` 进 `kbd_revision.review_metadata` + 结构化日志；网关零改动；
+    - **文案层**：共享 humanizer 新增 `KBD_REJECTED_CANDIDATES_UNRESOLVED` 专属分支，报错给出两条出路与 `review_rejected_candidates` 前端动作；
+    - **前端**：被拒候选面板增加「复核忽略」（必填处置说明对话框）/「撤销处置」/「全部复核忽略」（串行 PATCH 逐条刷新乐观锁），已处置项展示操作人/时间/说明，全部处置后提示可按「仅案例推荐」发布；审查 issue 支持「定位并处理」滚动到面板。
+  - **行为放开面**：全部处置后的空信号 KBD 发布即进入既有仅案例推荐链路（标题/问题描述推荐池、CDD 未定论兜底推荐）；重新抽取整体重建文档并重置处置状态（历史存 KbdRevision）。
+  - **测试守护**：shared（处置放行/部分处置拦截/畸形 fail-closed/tool_restricted 回归）、kb-service（PATCH 分支落库与错误码/发布门禁/审查端点）、前端 spec（渲染态/单对象 PATCH body/缺说明不发请求/撤销流）共 20+ 用例。
+  - **文档**：`docs/solution/knowledge-base/events/2026-10-10-被拒候选专家复核处置与仅案例推荐降级门禁.md`；用户手册第 6 步、《关键信号抽取与建模设计》§4/§5、《接口设计》4.6 同步更新。
 - **工单 Q2026092053425 排障交互卡片无响应与容器执行失败修复**：
   - **根因**：
     - **点击交互无反应与超时取消**：`conversation-service` 转发用户交互确认到 `agent-service` 时漏传内部 `Authorization` Token，导致 401 失败并在前端静默吞咽，最终 Redis 等待 120 秒超时判定为操作已取消；

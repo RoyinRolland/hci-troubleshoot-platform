@@ -1,9 +1,15 @@
+import copy
 from unittest.mock import AsyncMock, MagicMock
 
 import app.routes.admin as admin_route
 import pytest
-from app.routes.admin import _prepare_expert_draft_signals, kbd_router, set_dependencies
-from fastapi import FastAPI
+from app.routes.admin import (
+    _apply_rejected_candidate_dismissal,
+    _prepare_expert_draft_signals,
+    kbd_router,
+    set_dependencies,
+)
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -94,7 +100,19 @@ async def test_update_kbd_entry_signals_json_sql_cast():
                 "candidate": {"id": "bad"},
                 "reason_code": "run_failed",
                 "reason": "缺少 acquire",
-            }
+            },
+            # 已处置候选 + tool_restricted 分类码：整稿保存必须原样透传处置标记，
+            # 否则专家“复核忽略”会被后续任意保存静默冲掉（发布门禁随之复活）。
+            {
+                "candidate": {"id": "dismissed"},
+                "reason_code": "tool_restricted",
+                "reason": "qfk_var 自由文本候选被剥离",
+                "expert_dismissal": {
+                    "reviewed_by": "42",
+                    "reviewed_at": "2026-10-10T08:00:00+00:00",
+                    "note": "已确认无恢复价值",
+                },
+            },
         ],
         "signals": [
             {
@@ -248,3 +266,198 @@ async def test_update_kbd_entry_signals_with_produce_alias():
 
     admin_route._check_auth = original_check_auth
     assert response.status_code == 200, response.text
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 被拒候选专家处置（复核忽略 / 撤销处置，2026-10-10）
+# ─────────────────────────────────────────────────────────────────────────────
+
+REJECTED_DOC = {
+    "schema_version": 2,
+    "signals": [],
+    "rejected_candidates": [
+        {
+            "candidate": {"id": "sig_002"},
+            "reason_code": "run_failed",
+            "reason": "keyword Matcher 的 match.pattern 无法从 provenance.evidence 逐字追溯",
+        },
+        {
+            "candidate": {"id": "sig_003"},
+            "reason_code": "run_failed",
+            "reason": "operator 'gte' 非法",
+        },
+    ],
+}
+
+
+def _dismissal_test_client(signals_doc, *, lock_version=3):
+    """构造 update_kbd_entry 处置分支所需的最小 mock 环境。"""
+    app = FastAPI()
+    app.include_router(kbd_router)
+    mock_db = MagicMock()
+    mock_session = AsyncMock()
+    mock_session.__aenter__.return_value = mock_session
+    mock_db.async_session_factory.return_value = mock_session
+    mock_row = MagicMock()
+    kbd_mock = mock_row.scalar_one_or_none.return_value
+    kbd_mock.status = "draft"
+    kbd_mock.lock_version = lock_version
+    kbd_mock.signals_json = copy.deepcopy(signals_doc)
+    kbd_mock.images_json = []
+    mock_row.mappings.return_value.first.return_value = {
+        "id": 1,
+        "status": "draft",
+        "lock_version": lock_version + 1,
+    }
+    mock_session.execute.return_value = mock_row
+    original_check_auth = admin_route._check_auth
+    admin_route._check_auth = lambda req: None
+    set_dependencies(mock_db)
+    client = TestClient(app)
+    return client, mock_session, original_check_auth
+
+
+def _stored_signals_json(mock_session):
+    import json as json_module
+
+    executed_call = next(
+        call for call in reversed(mock_session.execute.call_args_list) if "UPDATE kbd_entry SET" in str(call[0][0])
+    )
+    stored = executed_call[0][1].get("signals_json")
+    return json_module.loads(stored) if isinstance(stored, str) else stored
+
+
+@pytest.mark.anyio
+async def test_dismiss_rejected_candidate_writes_expert_dismissal_and_keeps_snapshot():
+    client, mock_session, original = _dismissal_test_client(REJECTED_DOC)
+    try:
+        response = client.patch(
+            "/api/admin/kbd/1",
+            json={
+                "dismiss_rejected_candidate_id": "sig_002",
+                "dismiss_rejected_note": "案例确认为纯文本知识，候选无恢复价值",
+                "reviewer_id": 42,
+                "lock_version": 3,
+            },
+            headers={"Authorization": "Bearer dev-internalapi-api-token-2026"},
+        )
+    finally:
+        admin_route._check_auth = original
+    assert response.status_code == 200, response.text
+    stored = _stored_signals_json(mock_session)
+    dismissed = stored["rejected_candidates"][0]
+    # 审计快照原样保留，处置是附加事实
+    assert dismissed["candidate"] == {"id": "sig_002"}
+    assert dismissed["reason"] == "keyword Matcher 的 match.pattern 无法从 provenance.evidence 逐字追溯"
+    assert dismissed["expert_dismissal"]["reviewed_by"] == "42"
+    assert dismissed["expert_dismissal"]["note"] == "案例确认为纯文本知识，候选无恢复价值"
+    assert dismissed["expert_dismissal"]["reviewed_at"]
+    # 未处置的候选不受影响
+    assert "expert_dismissal" not in stored["rejected_candidates"][1]
+
+
+@pytest.mark.anyio
+async def test_dismiss_rejected_candidate_conflicts_and_lock_guard():
+    # 处置不得与整稿保存同时提交（V-007 单对象语义）
+    client, _mock_session, original = _dismissal_test_client(REJECTED_DOC)
+    try:
+        response = client.patch(
+            "/api/admin/kbd/1",
+            json={
+                "dismiss_rejected_candidate_id": "sig_002",
+                "dismiss_rejected_note": "说明",
+                "reviewer_id": 42,
+                "signals_json": REJECTED_DOC,
+            },
+            headers={"Authorization": "Bearer dev-internalapi-api-token-2026"},
+        )
+        assert response.status_code == 400
+        # 乐观锁不匹配 → 409
+        conflict = client.patch(
+            "/api/admin/kbd/1",
+            json={
+                "dismiss_rejected_candidate_id": "sig_002",
+                "dismiss_rejected_note": "说明",
+                "reviewer_id": 42,
+                "lock_version": 99,
+            },
+            headers={"Authorization": "Bearer dev-internalapi-api-token-2026"},
+        )
+    finally:
+        admin_route._check_auth = original
+    assert conflict.status_code == 409
+    assert conflict.json()["detail"]["code"] == "KBD_EDIT_CONFLICT"
+
+
+def test_apply_rejected_candidate_dismissal_validation_errors():
+    # 候选不存在 → 404（不提供展示序号兜底）
+    with pytest.raises(HTTPException) as not_found:
+        _apply_rejected_candidate_dismissal(
+            REJECTED_DOC, candidate_id="sig_999", revoke=False, note="说明", reviewer_id=42
+        )
+    assert not_found.value.status_code == 404
+    assert not_found.value.detail["code"] == "KBD_REJECTED_CANDIDATE_NOT_FOUND"
+
+    # 缺处置说明 → 422
+    with pytest.raises(HTTPException) as no_note:
+        _apply_rejected_candidate_dismissal(REJECTED_DOC, candidate_id="sig_002", revoke=False, note="  ", reviewer_id=42)
+    assert no_note.value.status_code == 422
+    assert no_note.value.detail["code"] == "KBD_REJECTED_DISMISSAL_NOTE_REQUIRED"
+
+    # 缺操作人 → 422
+    with pytest.raises(HTTPException) as no_reviewer:
+        _apply_rejected_candidate_dismissal(REJECTED_DOC, candidate_id="sig_002", revoke=False, note="说明", reviewer_id=None)
+    assert no_reviewer.value.status_code == 422
+    assert no_reviewer.value.detail["code"] == "KBD_REJECTED_DISMISSAL_REVIEWER_REQUIRED"
+
+    # 候选 ID 重复 → 422 fail-closed
+    duplicated = copy.deepcopy(REJECTED_DOC)
+    duplicated["rejected_candidates"].append(copy.deepcopy(duplicated["rejected_candidates"][0]))
+    with pytest.raises(HTTPException) as ambiguous:
+        _apply_rejected_candidate_dismissal(duplicated, candidate_id="sig_002", revoke=False, note="说明", reviewer_id=42)
+    assert ambiguous.value.status_code == 422
+    assert ambiguous.value.detail["code"] == "KBD_REJECTED_CANDIDATE_AMBIGUOUS"
+
+
+def test_revoke_rejected_dismissal_is_idempotent():
+    dismissed_once = _apply_rejected_candidate_dismissal(
+        REJECTED_DOC, candidate_id="sig_002", revoke=False, note="说明", reviewer_id=42
+    )
+    assert dismissed_once["rejected_candidates"][0]["expert_dismissal"]["reviewed_by"] == "42"
+
+    # 重复处置：覆盖为最新处置（幂等，不报错）
+    dismissed_twice = _apply_rejected_candidate_dismissal(
+        dismissed_once, candidate_id="sig_002", revoke=False, note="更新说明", reviewer_id=43
+    )
+    assert dismissed_twice["rejected_candidates"][0]["expert_dismissal"]["note"] == "更新说明"
+
+    # 撤销：移除处置标记，快照保留
+    revoked = _apply_rejected_candidate_dismissal(dismissed_twice, candidate_id="sig_002", revoke=True)
+    assert "expert_dismissal" not in revoked["rejected_candidates"][0]
+    assert revoked["rejected_candidates"][0]["candidate"] == {"id": "sig_002"}
+
+    # 撤销不存在的处置：幂等成功
+    revoked_again = _apply_rejected_candidate_dismissal(revoked, candidate_id="sig_002", revoke=True)
+    assert "expert_dismissal" not in revoked_again["rejected_candidates"][0]
+
+
+@pytest.mark.anyio
+async def test_revoke_rejected_candidate_endpoint_removes_marker():
+    dismissed_doc = copy.deepcopy(REJECTED_DOC)
+    dismissed_doc["rejected_candidates"][0]["expert_dismissal"] = {
+        "reviewed_by": "42",
+        "reviewed_at": "2026-10-10T08:00:00+00:00",
+        "note": "误处置",
+    }
+    client, mock_session, original = _dismissal_test_client(dismissed_doc)
+    try:
+        response = client.patch(
+            "/api/admin/kbd/1",
+            json={"revoke_rejected_candidate_id": "sig_002", "lock_version": 3},
+            headers={"Authorization": "Bearer dev-internalapi-api-token-2026"},
+        )
+    finally:
+        admin_route._check_auth = original
+    assert response.status_code == 200, response.text
+    stored = _stored_signals_json(mock_session)
+    assert "expert_dismissal" not in stored["rejected_candidates"][0]

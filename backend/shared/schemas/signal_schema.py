@@ -269,6 +269,17 @@ def humanize_signal_validation_error(error: ValidationError, signals: list[Any])
             "原文确实没有这三类入口时，可配置语义入口（qkv_case_context）并补齐诊断能力说明。"
         )
         code = "KBD_PRODUCER_SIGNAL_MISSING"
+    elif "无信号案例存在未处理的抽取异常或拒绝候选" in raw_message:
+        # 空信号 + 未处置被拒候选的发布门禁：必须给出专家可执行的两条出路，
+        # 不能落入“请按该原因修正”的兜底文案（历史上造成处置死锁感知）。
+        field_path = "rejected_candidates"
+        field_label = "关键信号 / 被拒候选"
+        message = (
+            "案例已无关键信号，但仍有被拒候选未复核。请逐条处理："
+            "恢复并修正为有效信号，或填写处置说明标记「已复核忽略」；"
+            "全部处理后即可按「仅案例推荐」发布。"
+        )
+        code = "KBD_REJECTED_CANDIDATES_UNRESOLVED"
     elif "控制台截图信号需要可信的 HOST 与 VM_ID 来源" in raw_message:
         field_path = "signals"
         field_label = "条件型生产者"
@@ -423,6 +434,9 @@ def humanize_signal_validation_error(error: ValidationError, signals: list[Any])
             "signal_id": signal_id,
             "focus": field_path or None,
         }
+    elif code == "KBD_REJECTED_CANDIDATES_UNRESOLVED":
+        # 文档级处置动作：前端据此滚动并展开“被拒候选”面板。
+        issue["action"] = {"type": "review_rejected_candidates"}
     if raw_message and raw_message != message:
         issue["validation_reason"] = raw_message
     return issue

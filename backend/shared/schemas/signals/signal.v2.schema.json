@@ -342,12 +342,38 @@
           "enum": [
             "write_signal",
             "not_exists",
-            "run_failed"
+            "run_failed",
+            "tool_restricted"
           ]
         },
         "reason": {
           "type": "string",
           "minLength": 1
+        },
+        "expert_dismissal": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "reviewed_by",
+            "reviewed_at",
+            "note"
+          ],
+          "properties": {
+            "reviewed_by": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 64
+            },
+            "reviewed_at": {
+              "type": "string",
+              "format": "date-time"
+            },
+            "note": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 500
+            }
+          }
         }
       }
     },

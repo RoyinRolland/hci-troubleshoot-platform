@@ -181,6 +181,23 @@ def test_rejected_candidate_reason_code_is_optional_for_historical_snapshots():
     assert "reason_code" not in document["rejected_candidates"][0]
 
 
+def test_tool_restricted_reason_code_passes_schema_validation():
+    """回归：qfk_var 剥离使用 tool_restricted 分类码，此前 enum 缺失导致落库校验必炸。"""
+    document = _signals_to_v2(
+        [],
+        rejected_candidates=[
+            {
+                "signal": {"id": "sig_001", "acquire": {"tool": "qfk_var"}},
+                "reason_code": "tool_restricted",
+                "reason": "qfk_var 自由文本候选被剥离",
+            }
+        ],
+    )
+
+    validate_signals_json(document)
+    assert document["rejected_candidates"][0]["reason_code"] == "tool_restricted"
+
+
 def test_simple_matcher_missing_extract_is_normalized_to_full_stdout():
     candidate = {
         "id": "sig_001",

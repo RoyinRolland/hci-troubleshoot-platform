@@ -64,6 +64,50 @@ def test_invalid_signal_document_cannot_be_published_as_reference(raw):
         admin._prepare_expert_publish_signals(raw)
 
 
+def _dismissed_rejected_doc(note="已确认候选无恢复价值"):
+    return {
+        "schema_version": 2,
+        "signals": [],
+        "rejected_candidates": [
+            {
+                "candidate": {"id": "sig_002"},
+                "reason_code": "run_failed",
+                "reason": "keyword 无法从 evidence 逐字追溯",
+                "expert_dismissal": {
+                    "reviewed_by": "42",
+                    "reviewed_at": "2026-10-10T08:00:00+00:00",
+                    "note": note,
+                },
+            }
+        ],
+    }
+
+
+def test_dismissed_rejected_candidates_allow_explicit_reference_downgrade():
+    """全部被拒候选经专家复核忽略后，空信号文档可按「仅案例推荐」发布。"""
+    from shared.schemas.semantic_entry import capability_of
+
+    document = _dismissed_rejected_doc()
+    prepared = admin._prepare_expert_publish_signals(document)
+    admin._require_kbd_consumer_or_reference(prepared)
+    assert capability_of(prepared) == "reference_only"
+    assert prepared["publish_validation"]["status"] == "passed"
+    # 发布盖章不得清理处置记录与审计快照
+    assert prepared["rejected_candidates"][0]["expert_dismissal"]["reviewed_by"] == "42"
+    assert prepared["rejected_candidates"][0]["candidate"] == {"id": "sig_002"}
+
+
+def test_partially_dismissed_rejected_candidates_still_block_reference_publish():
+    """部分处置仍视为“存在未处理的拒绝候选”，发布门禁继续拦截。"""
+    document = _dismissed_rejected_doc()
+    document["rejected_candidates"].append(
+        {"candidate": {"id": "sig_003"}, "reason_code": "run_failed", "reason": "operator 'gte' 非法"}
+    )
+    with pytest.raises(jsonschema.ValidationError) as exc_info:
+        admin._prepare_expert_publish_signals(document)
+    assert "无信号案例存在未处理的抽取异常或拒绝候选" in str(exc_info.value.message)
+
+
 def _payload() -> dict:
     return {
         "support_id": "37150",

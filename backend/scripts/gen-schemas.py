@@ -231,11 +231,26 @@ def build_signal_v2(mod: object, tools: list[str]) -> dict:
                     # 符合 signal definition，因此不能用 signal schema 约束。
                     "candidate": {},
                     # v2.1 起保存稳定的工程门禁分类；保持可选以兼容历史快照。
+                    # tool_restricted 与 extract_signals.REJECT_REASON_CODES 对齐
+                    # （qfk_var 自由文本候选剥离），缺失会导致落库文档校验失败。
                     "reason_code": {
                         "type": "string",
-                        "enum": ["write_signal", "not_exists", "run_failed"],
+                        "enum": ["write_signal", "not_exists", "run_failed", "tool_restricted"],
                     },
                     "reason": {"type": "string", "minLength": 1},
+                    # 专家“复核忽略”处置记录：被拒候选经显式处置后，空信号文档
+                    # 才可降级为仅案例推荐（is_reference_only 消费该字段）。
+                    # 处置是附加事实，审计快照（candidate/reason）必须原样保留。
+                    "expert_dismissal": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "required": ["reviewed_by", "reviewed_at", "note"],
+                        "properties": {
+                            "reviewed_by": {"type": "string", "minLength": 1, "maxLength": 64},
+                            "reviewed_at": {"type": "string", "format": "date-time"},
+                            "note": {"type": "string", "minLength": 1, "maxLength": 500},
+                        },
+                    },
                 },
             },
             "signal": {

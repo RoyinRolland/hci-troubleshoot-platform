@@ -13,14 +13,25 @@ export interface SignalV2 {
   review?: { require_human_confirm?: boolean }
 }
 
+// 专家“复核忽略”处置记录：服务端 PATCH 处置分支写入（signal.v2.schema.json
+// rejectedCandidate.expert_dismissal），审计快照本体（candidate/reason）不变。
+export interface RejectedCandidateDismissal {
+  reviewed_by: string
+  reviewed_at: string
+  note: string
+}
+
+export interface RejectedCandidateItem {
+  candidate: unknown
+  reason_code?: 'write_signal' | 'not_exists' | 'run_failed' | 'tool_restricted'
+  reason: string
+  expert_dismissal?: RejectedCandidateDismissal
+}
+
 export interface SignalsDoc {
   schema_version: number
   signals: SignalV2[]
-  rejected_candidates?: Array<{
-    candidate: unknown
-    reason_code?: 'write_signal' | 'not_exists' | 'run_failed'
-    reason: string
-  }>
+  rejected_candidates?: RejectedCandidateItem[]
   verification_contract?: Record<string, any>
   generation_metadata?: Record<string, any>
   publish_validation?: Record<string, any>

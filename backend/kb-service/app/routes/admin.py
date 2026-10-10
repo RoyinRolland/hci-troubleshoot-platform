@@ -450,6 +450,148 @@ def _delete_signal_from_document(raw: Any, signal_id: str) -> dict[str, Any]:
     return document
 
 
+def _rejected_disposal_operation(body: KbdUpdateRequest) -> tuple[str, str] | None:
+    """识别本次 PATCH 是否为被拒候选处置操作，返回 (candidate_id, "dismiss"|"revoke")。"""
+
+    if body.dismiss_rejected_candidate_id is not None:
+        return str(body.dismiss_rejected_candidate_id), "dismiss"
+    if body.revoke_rejected_candidate_id is not None:
+        return str(body.revoke_rejected_candidate_id), "revoke"
+    return None
+
+
+def _ensure_rejected_disposal_exclusive(body: KbdUpdateRequest) -> None:
+    """被拒候选处置是单对象操作，不得夹带整稿保存/删信号或另一处置（V-007）。"""
+
+    if body.dismiss_rejected_candidate_id is not None and body.revoke_rejected_candidate_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="dismiss_rejected_candidate_id 与 revoke_rejected_candidate_id 不能同时提交",
+        )
+    if _rejected_disposal_operation(body) is None:
+        return
+    if body.signals_json is not None or body.delete_signal_id is not None:
+        raise HTTPException(
+            status_code=400,
+            detail="被拒候选处置不得与 signals_json 或 delete_signal_id 同时提交",
+        )
+
+
+def _apply_rejected_candidate_dismissal(
+    raw: Any,
+    *,
+    candidate_id: str,
+    revoke: bool,
+    note: str | None = None,
+    reviewer_id: int | None = None,
+    kbd_id: int | None = None,
+) -> dict[str, Any]:
+    """按稳定候选 ID 对权威工作稿中的被拒候选应用专家处置（复核忽略/撤销）。
+
+    处置是附加审计事实：候选快照（candidate/reason/reason_code）原样保留，只写入或
+    移除 ``expert_dismissal``。全部候选处置后，空信号文档才可经 ``is_reference_only``
+    按「仅案例推荐」发布（《关键信号抽取与建模设计》：“未处理的拒绝候选仍须明确
+    复核”，处置即复核留痕；管道自动忽略仍被禁止）。撤销用于误处置回退——重新抽取
+    会整体重建文档，不是安全的恢复路径。定位失败 fail-closed，不提供展示序号兜底。
+    """
+
+    operation = "revoke_rejected_dismissal" if revoke else "dismiss_rejected_candidate"
+    normalized_id = str(candidate_id or "").strip()
+    document = copy.deepcopy(_load_signals_json(raw))
+    items = document.get("rejected_candidates")
+    matches: list[tuple[int, dict[str, Any]]] = []
+    if normalized_id and isinstance(items, list):
+        matches = [
+            (index, item)
+            for index, item in enumerate(items)
+            if isinstance(item, dict)
+            and isinstance(item.get("candidate"), dict)
+            and str(item["candidate"].get("id") or "").strip() == normalized_id
+        ]
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "code": "KBD_REJECTED_CANDIDATE_NOT_FOUND",
+                "message": f"被拒候选 {normalized_id or '(空 ID)'} 不存在；请刷新详情，或重新抽取生成新候选。",
+                "candidate_id": normalized_id or None,
+            },
+        )
+    if len(matches) > 1:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "code": "KBD_REJECTED_CANDIDATE_AMBIGUOUS",
+                "message": f"被拒候选 ID {normalized_id} 在文档中重复；为避免误处置已拒绝，请重新抽取重建候选列表。",
+                "candidate_id": normalized_id,
+            },
+        )
+    index, item = matches[0]
+    if revoke:
+        item.pop("expert_dismissal", None)
+    else:
+        normalized_note = str(note or "").strip()
+        if not normalized_note:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "KBD_REJECTED_DISMISSAL_NOTE_REQUIRED",
+                    "message": "复核忽略必须填写处置说明（不超过 500 字），用于审计与后续评估。",
+                },
+            )
+        if reviewer_id is None:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "code": "KBD_REJECTED_DISMISSAL_REVIEWER_REQUIRED",
+                    "message": "复核忽略必须提供操作人 ID（reviewer_id）；系统会如实记录为未认证身份。",
+                },
+            )
+        item["expert_dismissal"] = {
+            "reviewed_by": str(reviewer_id),
+            "reviewed_at": datetime.now(UTC).isoformat(),
+            "note": normalized_note,
+        }
+    items[index] = item
+    document["rejected_candidates"] = items
+    logger.info(
+        event="kbd_rejected_candidate_dismissal_revoked" if revoke else "kbd_rejected_candidate_dismissed",
+        kbd_id=kbd_id,
+        candidate_id=normalized_id,
+        reviewer_id=None if revoke else reviewer_id,
+    )
+    return _prepare_expert_draft_signals(document, kbd_id=kbd_id, operation=operation)
+
+
+def _rejected_disposal_annotation(body: KbdUpdateRequest, annotations: list[dict[str, str]]) -> list[dict[str, str]]:
+    """处置操作必须留下受控原因码标注；前端漏传时服务端补齐，保证审计可统计。"""
+
+    disposal = _rejected_disposal_operation(body)
+    if disposal is None:
+        return annotations
+    _candidate_id, kind = disposal
+    reason_code = "rejected_candidate_dismissal_revoked" if kind == "revoke" else "rejected_candidate_dismissed"
+    if any(item.get("reason_code") == reason_code for item in annotations):
+        return annotations
+    note = str(body.dismiss_rejected_note or "").strip()[:500]
+    # path 必须是 revision payload 根的 JSON Pointer（diff 路径形如
+    # /signals_json/rejected_candidates/N/expert_dismissal），否则 _find_annotation
+    # 前缀匹配失败，reason_counts 会落入推断码 other_expert_correction。
+    return [
+        *annotations,
+        {"path": "/signals_json/rejected_candidates", "reason_code": reason_code, **({"note": note} if note else {})},
+    ]
+
+
+def _rejected_disposal_revision_identity(body: KbdUpdateRequest) -> dict[str, Any]:
+    """处置操作的 revision 身份标记：与 reject/approve 相同的诚实未认证口径。"""
+
+    disposal = _rejected_disposal_operation(body)
+    if disposal is not None and disposal[1] == "dismiss" and body.reviewer_id is not None:
+        return {"identity_status": "unverified_body_reviewer_id", "legacy_reviewer_id": body.reviewer_id}
+    return {"identity_status": "unavailable"}
+
+
 if TYPE_CHECKING:
     from shared.database.postgres import DatabaseManager
 
@@ -4597,6 +4739,32 @@ class KbdUpdateRequest(BaseModel):
         max_length=256,
         description="按稳定 Signal ID 删除权威工作稿中的单条信号；不得与 signals_json 同时提交",
     )
+    # 被拒候选专家处置（复核忽略/撤销）：单对象操作，互斥约束同 delete_signal_id
+    dismiss_rejected_candidate_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description=(
+            "按稳定候选 ID 处置（复核忽略）权威工作稿中的单条被拒候选；"
+            "必须同时提供 dismiss_rejected_note 与 reviewer_id；不得与 signals_json/delete_signal_id 同时提交"
+        ),
+    )
+    revoke_rejected_candidate_id: str | None = Field(
+        None,
+        min_length=1,
+        max_length=256,
+        description="撤销指定被拒候选的专家处置记录（误处置回退）；互斥约束同 dismiss_rejected_candidate_id",
+    )
+    dismiss_rejected_note: str | None = Field(
+        None,
+        min_length=1,
+        max_length=500,
+        description="复核忽略的处置说明（处置时必填），随 expert_dismissal 落库供审计",
+    )
+    reviewer_id: int | None = Field(
+        None,
+        description="处置操作人 ID（处置时必填）；与 reject/approve 相同口径，如实记录为未认证身份",
+    )
     images_json: list[dict[str, Any]] | None = Field(
         None,
         description="截图 Evidence；按稳定 seq 整体保存",
@@ -4766,6 +4934,7 @@ def _patch_maintenance_payload(payload: dict[str, Any], body: KbdUpdateRequest) 
 
     if body.signals_json is not None and body.delete_signal_id is not None:
         raise HTTPException(status_code=400, detail="signals_json 与 delete_signal_id 不能同时提交")
+    _ensure_rejected_disposal_exclusive(body)
     result = copy.deepcopy(payload)
     section_fields = KbdEntry.SECTION_FIELDS
     source_changed = any(
@@ -4788,6 +4957,17 @@ def _patch_maintenance_payload(payload: dict[str, Any], body: KbdUpdateRequest) 
         result["signals_json"] = signals_doc
     elif body.delete_signal_id is not None:
         result["signals_json"] = _delete_signal_from_document(result.get("signals_json"), body.delete_signal_id)
+    else:
+        disposal = _rejected_disposal_operation(body)
+        if disposal is not None:
+            disposal_candidate_id, disposal_kind = disposal
+            result["signals_json"] = _apply_rejected_candidate_dismissal(
+                result.get("signals_json"),
+                candidate_id=disposal_candidate_id,
+                revoke=disposal_kind == "revoke",
+                note=body.dismiss_rejected_note,
+                reviewer_id=body.reviewer_id,
+            )
 
     old_images = copy.deepcopy(result.get("images_json") or [])
     if body.images_json is not None:
@@ -4895,7 +5075,9 @@ async def update_kbd_maintenance_working(
             annotations = normalize_change_annotations(body.change_annotations)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        annotations = _rejected_disposal_annotation(body, annotations)
         payload = _patch_maintenance_payload(current.payload_json, body)
+        revision_identity = _rejected_disposal_revision_identity(body)
         revision = await ensure_kbd_revision_payload(
             session,
             kbd=kbd,
@@ -4904,13 +5086,13 @@ async def update_kbd_maintenance_working(
             actor_type="expert",
             actor_id=None,
             parent_revision_id=current.id,
-            generation_metadata={"origin": "admin_maintenance", "status": "saved", "identity_status": "unavailable"},
+            generation_metadata={"origin": "admin_maintenance", "status": "saved", **revision_identity},
             validation_summary={"status": "saved", "publish_validation": "not_run"},
             review_metadata=build_review_metadata(
                 parent_payload=current.payload_json,
                 payload=payload,
                 annotations=annotations,
-                identity_status="unavailable",
+                identity_status=str(revision_identity["identity_status"]),
                 review_state="working",
             ),
             trace_id=get_current_trace_id(),
@@ -5125,6 +5307,7 @@ async def update_kbd_entry(request: Request, kbd_id: int, body: KbdUpdateRequest
         raise HTTPException(status_code=503, detail="数据库未就绪")
     if body.signals_json is not None and body.delete_signal_id is not None:
         raise HTTPException(status_code=400, detail="signals_json 与 delete_signal_id 不能同时提交")
+    _ensure_rejected_disposal_exclusive(body)
 
     # kbd_entry 仍是 Agent 当前生效内容的兼容主记录。已发布维护必须走独立 maintenance
     # working；普通 PATCH 不得把未审核内容写入主记录或静默切换 active。
@@ -5164,6 +5347,8 @@ async def update_kbd_entry(request: Request, kbd_id: int, body: KbdUpdateRequest
         or any_section_changed
         or body.signals_json is not None
         or body.delete_signal_id is not None
+        or body.dismiss_rejected_candidate_id is not None
+        or body.revoke_rejected_candidate_id is not None
         or body.images_json is not None
         or body.content_md is not None
         or body.content_raw is not None
@@ -5320,10 +5505,25 @@ async def update_kbd_entry(request: Request, kbd_id: int, body: KbdUpdateRequest
             annotations = normalize_change_annotations(body.change_annotations)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        annotations = _rejected_disposal_annotation(body, annotations)
         old_images_json = list(kbd.images_json or [])
 
         if body.delete_signal_id is not None:
             v2_doc = _delete_signal_from_document(kbd.signals_json, body.delete_signal_id)
+            set_clauses.append("signals_json = CAST(:signals_json AS jsonb)")
+            params["signals_json"] = json.dumps(v2_doc, ensure_ascii=False)
+
+        disposal = _rejected_disposal_operation(body)
+        if disposal is not None:
+            disposal_candidate_id, disposal_kind = disposal
+            v2_doc = _apply_rejected_candidate_dismissal(
+                kbd.signals_json,
+                candidate_id=disposal_candidate_id,
+                revoke=disposal_kind == "revoke",
+                note=body.dismiss_rejected_note,
+                reviewer_id=body.reviewer_id,
+                kbd_id=kbd_id,
+            )
             set_clauses.append("signals_json = CAST(:signals_json AS jsonb)")
             params["signals_json"] = json.dumps(v2_doc, ensure_ascii=False)
 
@@ -5362,6 +5562,7 @@ async def update_kbd_entry(request: Request, kbd_id: int, body: KbdUpdateRequest
             kbd.content_md = kbd.rebuild_content_md(old_images_json=old_images_json)
             kbd.content_raw = strip_markdown(kbd.content_md or "")
             await session.flush()
+        revision_identity = _rejected_disposal_revision_identity(body)
         expert_revision = await ensure_kbd_revision(
             session,
             kbd=kbd,
@@ -5369,13 +5570,13 @@ async def update_kbd_entry(request: Request, kbd_id: int, body: KbdUpdateRequest
             actor_type="expert",
             actor_id=None,
             parent_revision_id=parent_revision_id,
-            generation_metadata={"origin": "admin_working_edit", "identity_status": "unavailable"},
+            generation_metadata={"origin": "admin_working_edit", **revision_identity},
             validation_summary={"status": "saved", "publish_validation": "not_run"},
             review_metadata=build_review_metadata(
                 parent_payload=getattr(parent_revision, "payload_json", None) if parent_revision is not None else {},
                 payload=build_kbd_revision_payload(kbd),
                 annotations=annotations,
-                identity_status="unavailable",
+                identity_status=str(revision_identity["identity_status"]),
                 review_state="working",
             ),
             trace_id=get_current_trace_id(),

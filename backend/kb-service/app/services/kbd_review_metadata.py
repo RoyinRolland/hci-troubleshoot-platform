@@ -25,6 +25,10 @@ REASON_CODES = frozenset(
         "threshold_or_match_error",
         "wording_only",
         "other_expert_correction",
+        # 被拒候选专家处置（复核忽略/撤销处置）：由 PATCH 处置分支服务端补齐，
+        # 与 signals_json.rejected_candidates[].expert_dismissal 一一对应。
+        "rejected_candidate_dismissed",
+        "rejected_candidate_dismissal_revoked",
     }
 )
 

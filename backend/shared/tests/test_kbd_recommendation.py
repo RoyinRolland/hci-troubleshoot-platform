@@ -7,7 +7,25 @@ from jsonschema import ValidationError
 from shared.schemas.kbd_recommendation import recommend_cases
 from shared.schemas.semantic_entry import capability_of
 from shared.schemas.semantic_routing import resolve_candidates
-from shared.schemas.signal_schema import validate_kbd_publishable_signals_json
+from shared.schemas.signal_schema import (
+    validate_draft_signals_json,
+    validate_kbd_publishable_signals_json,
+    validate_signals_json,
+)
+
+
+def dismissed_candidate(identifier="sig_002"):
+    """构造一条已经专家显式处置（复核忽略）的被拒候选。"""
+    return {
+        "candidate": {"id": identifier},
+        "reason": "keyword Matcher 的 match.pattern 无法从 provenance.evidence 逐字追溯",
+        "reason_code": "run_failed",
+        "expert_dismissal": {
+            "reviewed_by": "42",
+            "reviewed_at": "2026-10-10T08:00:00+00:00",
+            "note": "已确认该案例为纯文本知识，候选无恢复价值",
+        },
+    }
 
 
 def reference(identifier="1", title="安装 Windows Server 2016 提示缺少介质驱动程序", **fields):
@@ -35,6 +53,61 @@ def test_empty_document_is_publishable_reference_and_invalid_signal_still_fails(
         validate_kbd_publishable_signals_json({**document, "semantic_entry_profile": {}})
     assert capability_of({**document, "rejected_candidates": [{"reason": "failed"}]}) is None
     assert capability_of({**document, "generation_metadata": {"status": "stale"}}) is None
+
+
+def test_dismissed_rejected_candidates_allow_explicit_reference_downgrade():
+    """全部被拒候选经专家显式处置后，空信号文档可降级为仅案例推荐。"""
+    document = reference()["signals_json"]
+    resolved = {**document, "rejected_candidates": [dismissed_candidate()]}
+    # 处置记录本身必须是合法 Schema 形态（工作稿/发布/抽取落库共用校验）
+    validate_signals_json(resolved)
+    validate_draft_signals_json(resolved)
+    validate_kbd_publishable_signals_json(resolved)
+    assert capability_of(resolved) == "reference_only"
+
+    # 部分处置：仍视为“存在未处理的拒绝候选”，继续拦截
+    partial = {
+        **document,
+        "rejected_candidates": [
+            dismissed_candidate(),
+            {"candidate": {"id": "sig_003"}, "reason": "operator 'gte' 非法", "reason_code": "run_failed"},
+        ],
+    }
+    assert capability_of(partial) is None
+    with pytest.raises(ValidationError):
+        validate_kbd_publishable_signals_json(partial)
+
+    # 畸形处置记录：fail-closed，一律按未处置处理
+    for bad_dismissal in (
+        None,
+        "dismissed",
+        {"reviewed_by": "42", "reviewed_at": "", "note": "有说明"},
+        {"reviewed_by": "42", "reviewed_at": "2026-10-10T08:00:00+00:00", "note": "   "},
+        {"reviewed_at": "2026-10-10T08:00:00+00:00", "note": "有说明"},
+    ):
+        malformed = {**dismissed_candidate(), "expert_dismissal": bad_dismissal}
+        assert capability_of({**document, "rejected_candidates": [malformed]}) is None
+    # 候选项本身畸形（非 dict）同样 fail-closed
+    assert capability_of({**document, "rejected_candidates": ["not-a-dict"]}) is None
+    # rejected_candidates 畸形为非列表时 fail-closed
+    assert capability_of({**document, "rejected_candidates": {"candidate": {}}}) is None
+
+
+def test_tool_restricted_reason_code_is_schema_valid():
+    """qfk_var 剥离使用的 tool_restricted 分类码必须能通过文档校验（回归既有 enum 缺失 bug）。"""
+    document = {
+        "schema_version": 2,
+        "signals": [],
+        "rejected_candidates": [
+            {
+                "candidate": {"id": "sig_001", "acquire": {"tool": "qfk_var"}},
+                "reason": "qfk_var 自由文本候选被剥离，禁止 LLM 自由发明现场命令",
+                "reason_code": "tool_restricted",
+            }
+        ],
+    }
+    validate_signals_json(document)
+    validate_draft_signals_json(document)
 
 
 @pytest.mark.asyncio
