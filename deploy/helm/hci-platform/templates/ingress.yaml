@@ -137,6 +137,16 @@ spec:
                 name: customer-ui
                 port:
                   number: {{ .Values.customerUI.port }}
+          # 日志收集分片数据面：32 MiB 分片超出网关 1 MiB 限制，直连 case-service。
+          # 放在末尾不影响匹配：Ingress 按最长前缀优先，不依赖声明顺序；
+          # 同时保持既有 paths[i] 索引不变（helm unittest 依赖顺序断言）。
+          - path: /api/direct/log-collect-uploads
+            pathType: Prefix
+            backend:
+              service:
+                name: case-service
+                port:
+                  number: {{ .Values.caseService.port }}
     {{- end }}
   {{- if .Values.ingress.tls }}
   tls:
