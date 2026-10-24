@@ -42,7 +42,7 @@
 **数据库与迁移**
 
 1. 凡 `database/desired_extras.sql` 中**无条件重建**的对象（枚举型 CHECK 尤甚），扩值必须 `desired_schema.sql` 与 `desired_extras.sql` **同改**：CI 执行序列是 `extras → atlas apply → extras`，只改 schema 必然残留 diff。
-2. Prompt 种子**必须**放 `database/seeds/02_system_prompts.sql`（由 Helm db-seed-job PostSync 应用）。`database/atlas-migrations/` 从不被 `scripts/db-migrate.sh` 应用，放错位置会让生产路由 100% 抛 `PromptLoadError`。
+2. Prompt 种子**必须**放 `database/seeds/02_system_prompts.sql`（由 Helm db-seed-job PostSync 应用）。迁移链路只应用 `seeds/`、`data-migrations/`、`desired_schema.sql`、`desired_extras.sql` 四类输入，放错位置会让生产路由 100% 抛 `PromptLoadError`。
 3. AI 派生元数据列（`root_signal_json`、`ai_category_id`）不入 `kbd_revision`、不动 content_md/embedding/tsv，写回路径**禁止**使用 `require_mutable_kbd`（published 回刷必撞 409）。
 
 **服务契约与网关**
@@ -91,39 +91,53 @@
 
 ```
 hci-troubleshoot-platform/
-├── backend/
-│   ├── api-gateway/          # 流量入口、路由代理、WebSocket  [独立 Workspace]
-│   ├── case-service/         # 工单全生命周期 CRUD + 状态机    [独立 Workspace]
-│   ├── conversation-service/ # 对话管理、SSE 流式            [独立 Workspace]
-│   ├── scheduler-service/    # Pod 热备池调度                [独立 Workspace]
-│   └── shared/               # 共享代码（models, utils, db）  [⚠️ 需最先完成]
+├── backend/                      # 10 个微服务 + shared，各服务自带 pyproject.toml
+│   ├── api-gateway/              # 流量入口、路由代理、WebSocket
+│   ├── agent-service/            # Agent 执行引擎：工具调用、技能、effect 验证
+│   ├── diagnosis-service/        # 诊断会话状态机、证据包、报告生成
+│   ├── kb-service/               # 知识库：KBD 条目、审核、信号抽取、SOP
+│   ├── conversation-service/     # 对话管理、SSE 流式
+│   ├── case-service/             # 工单全生命周期 CRUD + 状态机
+│   ├── scheduler-service/        # Pod 热备池调度
+│   ├── auth-service/             # 认证鉴权（JWT 签发与校验）
+│   └── shared/                   # 共享代码（models, utils, db, security）[⚠️ 需最先完成]
 ├── frontend/
-│   ├── customer/             # 客户端对话 UI                 [独立 Workspace]
-│   ├── admin/                # 管理控制台                    [独立 Workspace]
-│   └── shared/               # 共享类型 + API 客户端          [⚠️ 需最先完成]
-├── adapters/                 # CLI→OpenAI 适配器
-├── database/                 # desired_schema.sql / desired_extras.sql / seeds
-├── deploy/                   # Docker + Helm + 可观测性
-├── scripts/                  # 自动化脚本
-├── tests/                    # 根级测试
-├── docs/                     # 设计文档
-├── AGENTS.md                 # 本文件（项目规范，提交 git）
-├── CLAUDE.md                 # → AGENTS.md（符号链接）
-└── CLAUDE.local.md           # 个人本地配置（不提交 git）
+│   ├── customer/                 # 客户端对话 UI
+│   ├── admin/                    # 管理控制台
+│   └── shared/                   # 共享类型 + API 客户端 [⚠️ 需最先完成]
+├── data-pipeline/                # 离线/批量知识生产层（产出可审核的知识 Proposal）
+├── hci_sim/                      # 仿真环境（独立控制面数据库）
+├── terminal_bridge/              # SSH Bridge（Go；桌面端与 K3s 共用同一套源码）
+├── dsh/                          # DSH（DeepSeek Harness）Web UI 容器镜像
+├── evaluation/                   # 评估脚本 + golden tickets + live E2E
+├── skills/                       # 排障技能 Markdown（任务解析、告警解析等）
+├── tools/ticket-sync/            # 工单同步工具
+├── database/                     # desired_schema.sql / desired_extras.sql / seeds
+├── deploy/                       # Docker + Helm + 可观测性
+├── scripts/                      # 自动化脚本
+├── tests/                        # 根级跨服务测试
+├── docs/                         # 设计文档
+├── AGENTS.md                     # 本文件（项目规范，提交 git）
+├── CLAUDE.md                     # → AGENTS.md（符号链接）
+└── CLAUDE.local.md               # 个人本地配置（不提交 git）
 ```
+
+> 各后端服务虽有独立 `pyproject.toml`，但根 `[tool.uv]` **未启用 workspace 成员解析**
+> （服务间 httpx/fastapi 版本未统一），因此依赖需按服务分别同步。
 
 ### 模块所有权规则
 
 - `shared/` 模块修改需最高优先级完成，其他模块依赖它
-- 每个微服务（`backend/xxx-service/`）是独立的 Workspace 单元
+- 每个微服务（`backend/xxx-service/`）有独立 `pyproject.toml`
 - 前端双应用（`customer/` + `admin/`）可并行，但共享类型变更需先完成
 - `database/desired_schema.sql` 或 `database/desired_extras.sql` 修改必须附带迁移说明
 - **给已存在数据的表新增 `NOT NULL` 列必须带 DEFAULT**：`atlas schema apply` 会直接下发
   `ADD COLUMN ... NOT NULL`，无默认值时 PostgreSQL 因存量行无法填值而整体失败
   （`column "x" contains null values`），进而阻塞 db-migrate 的 PreSync hook 与环境同步
-- **`database/atlas-migrations/` 不会被打进 db-migrate 镜像**：`Dockerfile.migrations` 只
-  `COPY database/data-migrations/`，写在该目录的迁移不会执行。存量兼容逻辑要么落在
-  `database/data-migrations/`，要么直接表达在 `desired_schema.sql` 的列定义上
+- **本项目无 Schema 迁移版本目录**：`atlas.hcl` 未配置 `migration_dir`，`atlas migrate *`
+  命令无效；`database/atlas-migrations/` 已于 2026-10-24 整体删除（具体依据见
+  `database/README.md`）。存量兼容逻辑要么落在 `database/data-migrations/`，要么直接
+  表达在 `desired_schema.sql` 的列定义上；变更历史由 Git 承载，禁止重建该目录
 
 ---
 
