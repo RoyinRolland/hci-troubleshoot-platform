@@ -39,8 +39,18 @@ const { sentMessages, fakeSocket, mockStore } = vi.hoisted(() => {
       sshCurrentConfig: null as null | { host: string; port: number; username: string },
       logCollectActiveTask: null,
       openLogCollectCaseDialog: vi.fn(),
-      // 抽屉宽度与历史工单共用同一真值
-      sidePanelWidth: 510,
+      // 抽屉宽度由工作区布局求解器给出，面板只读不再自持
+      leftPanelWidth: 520,
+      workspaceLayout: {
+        mode: 'slide' as const,
+        leftWidth: 520,
+        rightWidth: 0,
+        centerMaxWidth: 900,
+        leftOffset: 520,
+        rightOffset: 0,
+      },
+      setLeftPanelPreferred: vi.fn(),
+      setPanelResizing: vi.fn(),
     },
   }
 })
@@ -80,6 +90,19 @@ const passthrough = (name: string, tag = 'div') => ({
     return () => h(tag, slots.default?.())
   },
 })
+
+// label 是属性而非插槽，纯透传桩会把它丢掉，导致"字段顺序 / 字段文案"无法断言
+const ElDescriptionsItem = {
+  name: 'ElDescriptionsItem',
+  props: ['label'],
+  setup(props: any, { slots }: any) {
+    return () =>
+      h('div', { class: 'desc-item' }, [
+        h('span', { class: 'desc-label' }, props.label),
+        h('span', { class: 'desc-val' }, slots.default?.()),
+      ])
+  },
+}
 
 // ElAlert 的 title 是属性而非插槽，透传桩会丢掉它；这里显式渲染出来，
 // 否则"完成态"一类文案无法在测试里断言。
@@ -131,8 +154,24 @@ function mountPanel() {
           ElForm: passthrough('ElForm'),
           ElFormItem: passthrough('ElFormItem'),
           ElAlert,
-          ElDescriptions: passthrough('ElDescriptions'),
-          ElDescriptionsItem: passthrough('ElDescriptionsItem'),
+          // 描述表要断言列数：窄抽屉必须退成单列，字段名才不会逐字竖排
+          ElDescriptions: {
+            name: 'ElDescriptions',
+            props: ['column'],
+            setup(props: any, { attrs, slots }: any) {
+              return () =>
+                h(
+                  'div',
+                  {
+                    ...attrs,
+                    class: ['desc-stub', attrs.class],
+                    'data-column': String(props.column),
+                  },
+                  slots.default?.(),
+                )
+            },
+          },
+          ElDescriptionsItem,
           ElTag: passthrough('ElTag'),
           ElInput: passthrough('ElInput'),
           ElDatePicker: passthrough('ElDatePicker'),
@@ -155,6 +194,8 @@ describe('LogCollectPanel', () => {
     mockStore.lastSshHost = ''
     mockStore.sshConnectionState = 'disconnected'
     mockStore.sshCurrentConfig = null
+    // 抽屉宽度用例会改写，逐例复位，避免用例间互相污染
+    mockStore.leftPanelWidth = 520
     // 默认"该工单没有任何历史任务"，需要历史的任务用例自行 mock
     vi.mocked(logCollectApi.listTasks).mockReset()
     vi.mocked(logCollectApi.listTasks).mockResolvedValue({ total: 0, items: [] })
@@ -225,23 +266,65 @@ describe('LogCollectPanel', () => {
     expect(probe.node_ip).toBe('172.28.25.1')
   })
 
-  it('抽屉从左侧弹出，宽度取自共享真值', async () => {
+  it('抽屉从左侧弹出，宽度取自工作区求解结果', async () => {
     const wrapper = mountPanel()
     await flushPromises()
 
     const drawer = wrapper.find('.drawer-stub')
     expect(drawer.attributes('data-direction')).toBe('ltr')
-    expect(drawer.attributes('data-size')).toBe('510px')
+    expect(drawer.attributes('data-size')).toBe('520px')
   })
 
-  it('抽屉头部提供「刷新进度」与「钉住」入口', async () => {
+  it('抽屉头部提供「刷新进度」与「关闭」入口（钉住随推挤布局一并移除）', async () => {
     const wrapper = mountPanel()
     await flushPromises()
 
     const header = wrapper.find('.drawer-stub-header')
     expect(header.text()).toContain('日志收集')
     expect(header.text()).toContain('刷新进度')
-    expect(header.text()).toContain('钉住')
+    expect(header.text()).toContain('关闭')
+    expect(header.text()).not.toContain('钉住')
+  })
+
+  // 回归：两抽屉同时展开时左栏被压到 500px 上下，
+  // descriptions 固定 2 列会把「发起节点」压成一字一行。列数必须跟随抽屉宽度。
+  it('描述表列数随抽屉宽度切换：窄容器单列、宽容器两列', async () => {
+    const probeResult = {
+      architecture: 'x86_64',
+      acli_installed: true,
+      acli_version: '1.0.0',
+      available_mb: 1024,
+      hosts: [],
+    }
+    // 描述表只在 probe 成功后渲染：先推一帧探测结果，再断言列数
+    const mountAndProbe = async (width: number) => {
+      mockStore.leftPanelWidth = width
+      const wrapper = mountPanel()
+      await flushPromises()
+      await new Promise((resolve) => setTimeout(resolve, 5))
+      fakeSocket.onmessage?.({
+        data: JSON.stringify({
+          type: 'log_collect_result',
+          log_action: 'probe',
+          status: 'ok',
+          log_data: probeResult,
+        }),
+      })
+      await flushPromises()
+      return wrapper
+    }
+
+    const narrow = await mountAndProbe(460)
+    const narrowDescs = narrow.findAll('.desc-stub')
+    expect(narrowDescs).toHaveLength(1)
+    expect(narrowDescs[0].attributes('data-column')).toBe('1')
+    narrow.unmount()
+
+    const wide = await mountAndProbe(620)
+    const wideDescs = wide.findAll('.desc-stub')
+    expect(wideDescs).toHaveLength(1)
+    expect(wideDescs[0].attributes('data-column')).toBe('2')
+    wide.unmount()
   })
 
   it('故障场景使用勾选框全量展示，不渲染下拉框', async () => {
@@ -419,6 +502,48 @@ describe('LogCollectPanel', () => {
     expect(labels).toContain('重新收集')
     // 完成态下不应把"再收一次"当成默认动作
     expect(labels).not.toContain('开始收集')
+    wrapper.unmount()
+  })
+
+  // 现场反馈：产物位置是长路径，排在右列会把行高撑成两行且右侧留白；
+  // 换成「产物位置在左、归档状态在右」后路径靠左读，短文案收口在右。
+  it('结果态字段顺序把产物位置排在归档状态之前', async () => {
+    vi.mocked(logCollectApi.listTasks).mockResolvedValue({ total: 1, items: [taskFixture()] })
+
+    const wrapper = mountPanel()
+    await flushPromises()
+    await flushPromises()
+
+    const labels = wrapper.findAll('.desc-label').map((node) => node.text())
+    expect(labels.slice(-2)).toEqual(['产物位置', '归档状态'])
+    // 大小正常展示成 MB，不再落到「未记录」
+    expect(wrapper.text()).toContain('100.0 MB')
+    wrapper.unmount()
+  })
+
+  // P1 的大小只能在上传窗口内 stat 到，插件删包后就永久缺失；
+  // 文案必须说明原因，否则用户会以为平台漏采。
+  it('P1 直传未量到压缩包大小时给出原因文案', async () => {
+    vi.mocked(logCollectApi.listTasks).mockResolvedValue({
+      total: 1,
+      items: [
+        taskFixture({
+          upload_mode: 'acli_direct',
+          remote_url: 'http://172.28.25.1:5888/upload',
+          archive_path: '/sf/data/local/acli/tmp/data/log_collect/Q2026102300001.zip',
+          archive_size: null,
+          archive_sha256: null,
+          relay_status: 'none',
+        }),
+      ],
+    })
+
+    const wrapper = mountPanel()
+    await flushPromises()
+    await flushPromises()
+
+    const sizeItem = wrapper.findAll('.desc-item').find((node) => node.text().includes('压缩包大小'))
+    expect(sizeItem?.text()).toContain('未记录（直传后压缩包已删除）')
     wrapper.unmount()
   })
 

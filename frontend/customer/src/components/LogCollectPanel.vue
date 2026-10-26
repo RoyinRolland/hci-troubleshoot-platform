@@ -37,22 +37,40 @@ const visible = defineModel<boolean>({ required: true })
 const chatStore = useChatStore()
 
 // ── 抽屉行为（与历史工单/SSH 终端一致）────────────────────────────────────
-const pinned = ref(false)
+/** 只有窄屏降级时才需要遮罩；推挤态抽屉与主区互不遮挡 */
+const isOverlayMode = computed(() => chatStore.workspaceLayout.mode === 'overlay')
 
-/** 拖拽右边缘调整宽度：写入共享宽度，历史工单抽屉同步变化 */
+/**
+ * 描述表列数随抽屉宽度切换。
+ *
+ * el-descriptions 的列数是 JS 属性，CSS 容器查询改不动；而抽屉宽度本身就是
+ * 唯一真值，直接用它判断比再挂一个 ResizeObserver 更可靠。
+ * 600px 是「96px 字段名 + ≥140px 值」两列都不折行的下限。低于它硬上两列，
+ * 「P1 直传日志服务器」这种 9 字文案就会折成两行，反而比单列更碎。
+ */
+const descColumns = computed(() => (chatStore.leftPanelWidth >= 600 ? 2 : 1))
+
+/** 表单标签：窄容器下置顶，避免标签列继续吃掉本就不多的内容宽度 */
+const formLabelPosition = computed(() => (chatStore.leftPanelWidth < 480 ? 'top' : 'right'))
+
+/** 拖拽右边缘调整宽度：只写左侧偏好宽度，由求解器重新分配 */
 function startResize(e: MouseEvent) {
   e.preventDefault()
   const startX = e.clientX
-  const startWidth = chatStore.sidePanelWidth
-  const onMove = (ev: MouseEvent) => {
-    chatStore.sidePanelWidth = Math.max(
-      300,
-      Math.min(window.innerWidth * 0.8, startWidth + (ev.clientX - startX)),
-    )
-  }
+  const startWidth = chatStore.leftPanelWidth
+  chatStore.setPanelResizing(true)
   const onUp = () => {
+    chatStore.setPanelResizing(false)
     document.removeEventListener('mousemove', onMove)
     document.removeEventListener('mouseup', onUp)
+  }
+  const onMove = (ev: MouseEvent) => {
+    // 鼠标在窗口外松开时收不到 mouseup，靠按键状态兜底复位
+    if (ev.buttons === 0) {
+      onUp()
+      return
+    }
+    chatStore.setLeftPanelPreferred(startWidth + (ev.clientX - startX))
   }
   document.addEventListener('mousemove', onMove)
   document.addEventListener('mouseup', onUp)
@@ -131,6 +149,11 @@ interface ProgressSnapshot {
   done: number
   total: number
   archive_path: string
+  /**
+   * 压缩包字节数，由 bridge 在上传窗口内 stat 得到。
+   * 插件 progress 本身不打印大小，P1 成功后包会被自删，所以经常为 0（= 未量到）。
+   */
+  archive_size?: number
   upload_state: string
   hosts: Array<{ ip: string; status: string; percent: number }>
   /** 节点态归一化结果：none / running / completed / abnormal / unknown */
@@ -349,13 +372,6 @@ const resultHostsText = computed(() => {
   return `${ips.length} 台（${ips.join('、')}）`
 })
 
-const resultSizeText = computed(() => {
-  const size = resultTask.value?.archive_size
-  if (!size) return '未记录'
-  const mb = size / 1024 / 1024
-  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`
-})
-
 /**
  * 交付路径的判定口径。
  *
@@ -374,6 +390,22 @@ const resultDeliveryText = computed(() => {
   if (resultMode.value === 'acli_direct') return 'P1 直传日志服务器'
   if (resultMode.value === 'bridge_relay') return 'P2 经平台中转'
   return '未记录'
+})
+
+/**
+ * 压缩包大小。
+ *
+ * P1 的字节数只有两种来源：插件 progress 输出（不含大小）或节点上的文件本身（上传成功后
+ * 插件立刻自删）。bridge 会在上传窗口内 stat 一次回填，但轮询间隔内完成的小包常常错过，
+ * 因此 P1 空值属预期，文案要说清原因，别让用户以为平台漏采。
+ */
+const resultSizeText = computed(() => {
+  const size = resultTask.value?.archive_size
+  if (!size) {
+    return resultMode.value === 'acli_direct' ? '未记录（直传后压缩包已删除）' : '未记录'
+  }
+  const mb = size / 1024 / 1024
+  return mb >= 1024 ? `${(mb / 1024).toFixed(2)} GB` : `${mb.toFixed(1)} MB`
 })
 
 const resultArchiveText = computed(() => {
@@ -1203,6 +1235,8 @@ async function syncNodeState(
                   upload_mode:
                     currentTask.value.upload_mode ?? (currentTask.value.remote_url ? 'acli_direct' : undefined),
                   archive_path: snapshot.archive_path || currentTask.value.archive_path || undefined,
+                  // 节点侧只在包还在时量得到；已有值优先保留，避免 P2 的记录被 0 覆盖
+                  archive_size: snapshot.archive_size || currentTask.value.archive_size || undefined,
                 }
               : { status: 'failed' as const, error_message: action.reason }
           currentTask.value = await logCollectApi.patchTask(currentTask.value.task_id, patch)
@@ -1430,6 +1464,9 @@ async function finishP1(task: LogCollectTask, snapshot: ProgressSnapshot | null)
   await markCompleted(task.task_id, {
     upload_mode: 'acli_direct',
     archive_path: snapshot?.archive_path || undefined,
+    // 大小来自 bridge 在上传窗口内的 stat（插件 progress 不打印大小）；
+    // 量不到就留空，结果态显示「未记录」而不是编一个数。
+    archive_size: snapshot?.archive_size || undefined,
   })
   stage.value = 'done'
   cleanupTip.value = 'P1 由插件直传日志服务器；上传成功后插件会自动删除 HCI 上的压缩包，无需人工清理。'
@@ -1684,18 +1721,20 @@ onBeforeUnmount(() => {
   <el-drawer
     v-model="visible"
     direction="ltr"
-    :size="`${chatStore.sidePanelWidth}px`"
+    :size="`${chatStore.leftPanelWidth}px`"
     :append-to-body="true"
     :modal="true"
-    :lock-scroll="!pinned"
-    :close-on-click-modal="!pinned"
-    :close-on-press-escape="!pinned"
+    :lock-scroll="isOverlayMode"
+    :close-on-click-modal="isOverlayMode"
+    :close-on-press-escape="true"
     :with-header="true"
-    :modal-class="pinned ? 'drawer-unblocked-overlay' : ''"
+    :show-close="false"
+    :modal-class="isOverlayMode ? '' : 'drawer-push-overlay'"
     class="workspace-drawer"
     @close="handleDrawerClose"
   >
-    <div class="drawer-resize-handle drawer-resize-right" @mousedown="startResize"></div>
+    <!-- 覆盖态宽度由降级规则决定，拖拽无效，手柄不出现以免误导 -->
+    <div v-if="!isOverlayMode" class="drawer-resize-handle drawer-resize-right" @mousedown="startResize"></div>
     <template #header>
       <div class="drawer-header">
         <span class="drawer-title">日志收集</span>
@@ -1710,9 +1749,7 @@ onBeforeUnmount(() => {
           >
             刷新进度
           </el-button>
-          <el-button text size="small" @click="pinned = !pinned">
-            {{ pinned ? '取消钉住' : '钉住' }}
-          </el-button>
+          <el-button text size="small" @click="visible = false">关闭</el-button>
         </div>
       </div>
     </template>
@@ -1753,15 +1790,18 @@ onBeforeUnmount(() => {
           :title="`该工单已完成日志收集（${resultFinishedText}）`"
           description="以下是平台记录的上一次收集结果；如需再次采集，点右下角「重新收集」。"
         />
-        <el-descriptions :column="2" border size="small">
+        <el-descriptions :column="descColumns" border size="small">
           <el-descriptions-item label="发起节点">{{ resultTask.origin_node_ip }}</el-descriptions-item>
           <el-descriptions-item label="交付路径">{{ resultDeliveryText }}</el-descriptions-item>
           <el-descriptions-item label="收集场景">{{ resultModulesText }}</el-descriptions-item>
           <el-descriptions-item label="时间范围">{{ resultRangeText }}</el-descriptions-item>
           <el-descriptions-item label="目标主机">{{ resultHostsText }}</el-descriptions-item>
           <el-descriptions-item label="压缩包大小">{{ resultSizeText }}</el-descriptions-item>
+          <!-- 产物位置在左、归档状态在右：长路径靠左读，短文案靠右收口，行高由路径决定 -->
+          <el-descriptions-item label="产物位置">
+            <span :title="resultArtifactText">{{ resultArtifactText }}</span>
+          </el-descriptions-item>
           <el-descriptions-item label="归档状态">{{ resultArchiveText }}</el-descriptions-item>
-          <el-descriptions-item label="产物位置">{{ resultArtifactText }}</el-descriptions-item>
         </el-descriptions>
         <el-alert
           v-if="resultCleanupTip"
@@ -1777,7 +1817,7 @@ onBeforeUnmount(() => {
       </div>
 
       <template v-else>
-        <el-descriptions v-if="probeResult" :column="2" border size="small" class="lc-probe">
+        <el-descriptions v-if="probeResult" :column="descColumns" border size="small" class="lc-probe">
           <el-descriptions-item label="架构">{{ probeResult.architecture }}</el-descriptions-item>
           <el-descriptions-item label="acli">
             <span :title="acliTitle">{{ acliVersionText }}</span>
@@ -1881,7 +1921,12 @@ onBeforeUnmount(() => {
         </el-alert>
 
         <!-- 探测期间只锁"提交"，不锁表单：用户可以先看清可填项，不必等探测结束 -->
-        <el-form :model="form" label-width="90px" :disabled="running">
+        <el-form
+          :model="form"
+          :label-position="formLabelPosition"
+          label-width="90px"
+          :disabled="running"
+        >
           <el-form-item label="故障场景">
             <!-- 全量平铺勾选：目录最多十余项，一次看全比"点开下拉再逐项找"少两次交互 -->
             <el-checkbox-group v-model="form.modules" class="lc-checkbox-group lc-module-group">
