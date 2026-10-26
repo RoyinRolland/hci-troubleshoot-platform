@@ -36,9 +36,7 @@ const props = defineProps<{ caseId: string; nodeIp?: string }>()
 const visible = defineModel<boolean>({ required: true })
 const chatStore = useChatStore()
 
-// ── 抽屉行为（与历史工单/SSH 终端一致）────────────────────────────────────
-/** 只有窄屏降级时才需要遮罩；推挤态抽屉与主区互不遮挡 */
-const isOverlayMode = computed(() => chatStore.workspaceLayout.mode === 'overlay')
+// ── 面板内容（外壳由 PanelShell 提供）──────────────────────────────────────
 
 /**
  * 描述表列数随抽屉宽度切换。
@@ -52,34 +50,6 @@ const descColumns = computed(() => (chatStore.leftPanelWidth >= 600 ? 2 : 1))
 
 /** 表单标签：窄容器下置顶，避免标签列继续吃掉本就不多的内容宽度 */
 const formLabelPosition = computed(() => (chatStore.leftPanelWidth < 480 ? 'top' : 'right'))
-
-/** 拖拽右边缘调整宽度：只写左侧偏好宽度，由求解器重新分配 */
-function startResize(e: MouseEvent) {
-  e.preventDefault()
-  const startX = e.clientX
-  const startWidth = chatStore.leftPanelWidth
-  chatStore.setPanelResizing(true)
-  const onUp = () => {
-    chatStore.setPanelResizing(false)
-    document.removeEventListener('mousemove', onMove)
-    document.removeEventListener('mouseup', onUp)
-  }
-  const onMove = (ev: MouseEvent) => {
-    // 鼠标在窗口外松开时收不到 mouseup，靠按键状态兜底复位
-    if (ev.buttons === 0) {
-      onUp()
-      return
-    }
-    chatStore.setLeftPanelPreferred(startWidth + (ev.clientX - startX))
-  }
-  document.addEventListener('mousemove', onMove)
-  document.addEventListener('mouseup', onUp)
-}
-
-/** 关闭抽屉时暂停自动刷新，避免面板不可见还在后台发起 SSH 命令 */
-function handleDrawerClose() {
-  stopAutoSync()
-}
 
 const RELAY_URL = 'http://acli.sangfor.com.cn:5888'
 const POLL_INTERVAL = 5000
@@ -1625,7 +1595,11 @@ function sleep(ms: number) {
 watch(
   visible,
   (open) => {
-    if (!open) return
+    if (!open) {
+      // 收起面板（v-show，不销毁）时停止自动刷新，避免不可见还在后台发 SSH 命令
+      stopAutoSync()
+      return
+    }
     if (form.dateRange.length === 0) {
       const today = new Date()
       const from = new Date(today.getTime() - 86400000)
@@ -1715,45 +1689,11 @@ onBeforeUnmount(() => {
 
 <template>
   <!--
-    与「历史工单」「SSH 终端」抽屉完全对齐：左侧滑出、共享宽度、可拖拽调宽、
-    支持钉住（钉住后点击外部不再回缩，仅切掉遮罩）、点外部/ESC 关闭。
+    左栏「日志收集」页签的内容。
+    外壳（标题、收起、拖拽宽度、折叠后的图标入口）统一由 PanelShell 提供，
+    这里不再自带抽屉，避免与 el-drawer 的遮罩/焦点/位移动画语义互相打架。
   -->
-  <el-drawer
-    v-model="visible"
-    direction="ltr"
-    :size="`${chatStore.leftPanelWidth}px`"
-    :append-to-body="true"
-    :modal="true"
-    :lock-scroll="isOverlayMode"
-    :close-on-click-modal="isOverlayMode"
-    :close-on-press-escape="true"
-    :with-header="true"
-    :show-close="false"
-    :modal-class="isOverlayMode ? '' : 'drawer-push-overlay'"
-    class="workspace-drawer"
-    @close="handleDrawerClose"
-  >
-    <!-- 覆盖态宽度由降级规则决定，拖拽无效，手柄不出现以免误导 -->
-    <div v-if="!isOverlayMode" class="drawer-resize-handle drawer-resize-right" @mousedown="startResize"></div>
-    <template #header>
-      <div class="drawer-header">
-        <span class="drawer-title">日志收集</span>
-        <div class="drawer-actions">
-          <span v-if="viewMode === 'form' && lastRefreshText" class="lc-refresh-time">{{ lastRefreshText }}</span>
-          <el-button
-            v-if="viewMode === 'form'"
-            text
-            size="small"
-            :loading="refreshingProgress"
-            @click="refreshProgress()"
-          >
-            刷新进度
-          </el-button>
-          <el-button text size="small" @click="visible = false">关闭</el-button>
-        </div>
-      </div>
-    </template>
-    <div class="drawer-body-content lc-body">
+  <div v-show="visible" class="lc-panel lc-body">
       <div class="lc-case-bar">
         <span class="lc-case-label">归档工单</span>
         <span class="lc-case-value">{{ caseId }}</span>
@@ -1765,6 +1705,19 @@ onBeforeUnmount(() => {
           @click="chatStore.openLogCollectCaseDialog()"
         >
           更换
+        </el-button>
+        <span class="lc-spacer"></span>
+        <span v-if="viewMode === 'form' && lastRefreshText" class="lc-refresh-time">
+          {{ lastRefreshText }}
+        </span>
+        <el-button
+          v-if="viewMode === 'form'"
+          text
+          size="small"
+          :loading="refreshingProgress"
+          @click="refreshProgress()"
+        >
+          刷新进度
         </el-button>
       </div>
 
@@ -2055,37 +2008,68 @@ onBeforeUnmount(() => {
           class="lc-cleanup"
         />
       </template>
-    </div>
 
-    <template #footer>
-      <el-button @click="visible = false">关闭</el-button>
-      <template v-if="viewMode === 'result'">
-        <el-button type="primary" @click="startRecollect">重新收集</el-button>
-      </template>
-      <template v-else>
-        <el-button
-          v-if="!running"
-          type="primary"
-          :disabled="prepareState === 'probing'"
-          @click="handleStart"
-        >
-          {{ prepareState === 'probing' ? '正在读取环境…' : '开始收集' }}
-        </el-button>
-        <el-button v-else type="danger" plain @click="handleCancel">取消</el-button>
-      </template>
-    </template>
-  </el-drawer>
+    <!--
+      底部操作区：与中央会话、SSH 终端同构（hint 行 + 36px 控件行 + 按钮组），
+      规范在 styles/panel-composer.css。这里没有输入控件，控件行留给状态摘要。
+    -->
+    <div class="panel-composer lc-composer">
+      <div class="panel-composer__hint">
+        <template v-if="viewMode === 'result'">
+          上次采集 {{ resultFinishedText }} · 本工单共 {{ historyTotal }} 条记录
+        </template>
+        <template v-else-if="lastRefreshText">{{ lastRefreshText }}</template>
+        <template v-else>选择时间范围与采集模块后开始收集</template>
+      </div>
+      <div class="panel-composer__body">
+        <div class="panel-composer__actions">
+          <template v-if="viewMode === 'result'">
+            <el-button type="primary" @click="startRecollect">重新收集</el-button>
+          </template>
+          <template v-else>
+            <el-button
+              v-if="!running"
+              type="primary"
+              :disabled="prepareState === 'probing'"
+              @click="handleStart"
+            >
+              {{ prepareState === 'probing' ? '正在读取环境…' : '开始收集' }}
+            </el-button>
+            <el-button v-else type="danger" plain @click="handleCancel">取消</el-button>
+          </template>
+        </div>
+      </div>
+    </div>
+  </div>
 </template>
 
 <style scoped>
-.lc-body {
+.lc-panel {
   display: flex;
   flex-direction: column;
   gap: 16px;
-  /* 抽屉 body 由全局样式设为 overflow:hidden，内容超高时必须自己滚 */
+  /* 面板高度由 PanelShell 的 body 决定，内容超高时自己滚 */
   overflow-y: auto;
   height: 100%;
   box-sizing: border-box;
+  padding: 12px 16px;
+}
+
+.lc-spacer {
+  flex: 1;
+}
+
+/*
+ * 底部操作区贴底：内容不足时靠 margin-top:auto 顶到底部，
+ * 内容溢出时靠 sticky 继续钉在可视区底部。
+ * 左右负 margin 抵消 .lc-panel 的 padding，让底条通栏贴边（与中央、终端一致）。
+ */
+.lc-composer {
+  position: sticky;
+  bottom: -12px;
+  z-index: 1;
+  margin: 0 -16px -12px;
+  margin-top: auto;
 }
 .lc-refresh-time {
   font-size: 12px;

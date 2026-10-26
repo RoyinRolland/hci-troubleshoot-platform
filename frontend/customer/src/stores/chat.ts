@@ -755,13 +755,49 @@ export const useChatStore = defineStore('chat', () => {
    * 只记录"偏好"，不直接记录"当前宽度"：窗口变窄时求解器仍能把抽屉收进可用区间，
    * 而不是让一个越界的固定值把中央会话挤到不可读。
    */
-  const leftPanelPreferred = ref<number>(WORKSPACE_CONSTRAINTS.leftDefault)
-  const rightPanelPreferred = ref<number>(WORKSPACE_CONSTRAINTS.rightDefault)
+  /**
+   * 用户拖拽后的偏好宽度；null = 用户没拖过，由求解器按视口比例给默认值。
+   *
+   * 这里必须是 null 而不是 520/720：一旦预填固定值，求解器就永远拿不到
+   * 「未拖拽」这个信号，1920 屏单开时中央会稳定拿走 1400、留一整片空灰。
+   */
+  const leftPanelPreferred = ref<number | null>(null)
+  const rightPanelPreferred = ref<number | null>(null)
 
   /** 左侧是否被占用：日志收集与历史工单互斥，同一时刻只允许一个。 */
   const isLeftPanelOpen = computed(() => logCollectVisible.value || showHistoryDrawer.value)
   /** 右侧是否被占用：SSH 终端。 */
   const isRightPanelOpen = computed(() => showTerminalSidebar.value)
+
+  /**
+   * 左侧面板当前页签。
+   *
+   * 面板化之后左栏是一个常驻面板（折叠成图标条），页签决定展开后显示哪一块；
+   * 与 logCollectVisible/showHistoryDrawer 并存，是为了让已有的打开/关闭
+   * 动作（含"无会话时先弹 SSH 框"这类分支）不需要重写。
+   */
+  const leftPanelTab = ref<'log' | 'history'>('log')
+
+  /** 终端历史回放：从右栏终端或左侧历史工单都能触发，状态放 store 才能共享 */
+  const showTerminalReplay = ref(false)
+  const terminalReplayCaseId = ref<string | null>(null)
+
+  function openTerminalReplay(caseId: string | null): void {
+    if (!caseId) return
+    terminalReplayCaseId.value = caseId
+    showTerminalReplay.value = true
+  }
+
+  function closeTerminalReplay(): void {
+    showTerminalReplay.value = false
+    terminalReplayCaseId.value = null
+  }
+
+  /** 折叠左面板但保留页签记忆：下次点图标条回到同一块内容 */
+  function collapseLeftPanel(): void {
+    logCollectVisible.value = false
+    showHistoryDrawer.value = false
+  }
 
   /** 三态布局求解结果，是 App 外壳与三个抽屉的唯一宽度真值。 */
   const workspaceLayout = computed(() =>
@@ -769,13 +805,39 @@ export const useChatStore = defineStore('chat', () => {
       viewport: viewportWidth.value,
       leftOpen: isLeftPanelOpen.value,
       rightOpen: isRightPanelOpen.value,
-      leftPreferred: leftPanelPreferred.value,
-      rightPreferred: rightPanelPreferred.value,
+      leftPreferred: leftPanelPreferred.value ?? undefined,
+      rightPreferred: rightPanelPreferred.value ?? undefined,
     }),
   )
 
   const leftPanelWidth = computed(() => workspaceLayout.value.leftWidth)
   const rightPanelWidth = computed(() => workspaceLayout.value.rightWidth)
+
+  /**
+   * 窄屏覆盖态强制左右互斥。
+   *
+   * 判定用「两侧都开」的求解结果，而不是当前 mode：本次打开前只有一侧，
+   * 此刻 mode 还是 slide，等另一侧真的打开才会退化成 overlay——
+   * 用当前 mode 判定等于永远慢一拍，最后就是两块面板各占 86% 叠在一起、
+   * 中央只剩一条缝还压着遮罩。
+   * 覆盖态本身就是"一次看一块"的语义；宽屏推挤得下时不受影响，可并排看日志与终端。
+   */
+  function enforceOverlayExclusive(side: 'left' | 'right'): void {
+    const bothOpen = resolveWorkspaceLayout({
+      viewport: viewportWidth.value,
+      leftOpen: true,
+      rightOpen: true,
+      leftPreferred: leftPanelPreferred.value ?? undefined,
+      rightPreferred: rightPanelPreferred.value ?? undefined,
+    })
+    if (bothOpen.mode !== 'overlay') return
+    if (side === 'left') {
+      showTerminalSidebar.value = false
+      return
+    }
+    logCollectVisible.value = false
+    showHistoryDrawer.value = false
+  }
 
   /**
    * 是否正在拖拽调宽。
@@ -841,6 +903,8 @@ export const useChatStore = defineStore('chat', () => {
   function openLogCollect(): void {
     // 左侧只有一块位置：日志收集与历史工单互斥，否则两个抽屉会叠在同一条边上。
     showHistoryDrawer.value = false
+    // 覆盖态再与右侧终端互斥：两侧各占 86% 会把中央压成一条缝
+    enforceOverlayExclusive('left')
     // 日志收集依赖 SSH 会话：未连接时一律先走弹框（内含统一 SSH 登录区），
     // 避免用户打开面板后卡在"环境探测失败"。
     if (sshConnectionState.value !== 'connected') {
@@ -900,6 +964,7 @@ export const useChatStore = defineStore('chat', () => {
       logCollectCaseDialogVisible.value = false
       // 面板打开即占用左栏，同侧的历史工单必须让位
       showHistoryDrawer.value = false
+      leftPanelTab.value = 'log'
       logCollectVisible.value = true
     } catch (e: any) {
       const status = e?.response?.status
@@ -921,6 +986,8 @@ export const useChatStore = defineStore('chat', () => {
   function openLogCollectForTask(taskId: string): void {
     logCollectResumeTaskId.value = taskId
     showHistoryDrawer.value = false
+    enforceOverlayExclusive('left')
+    leftPanelTab.value = 'log'
     logCollectVisible.value = true
   }
 
@@ -2015,6 +2082,9 @@ export const useChatStore = defineStore('chat', () => {
   async function openHistoryDrawer() {
     // 左侧互斥：历史工单与日志收集不能同时占用左栏
     logCollectVisible.value = false
+    // 覆盖态再与右侧终端互斥
+    enforceOverlayExclusive('left')
+    leftPanelTab.value = 'history'
     showHistoryDrawer.value = true
     try {
       const res = await caseApi.listByClient(clientId)
@@ -2110,6 +2180,7 @@ export const useChatStore = defineStore('chat', () => {
   /** 发送命令到终端（CommandBlock 手动模式调用，仅填充输入框） */
   function sendCommandToTerminal(command: string) {
     terminalInputCommand.value = command
+    enforceOverlayExclusive('right')
     showTerminalSidebar.value = true
   }
 
@@ -2187,6 +2258,7 @@ export const useChatStore = defineStore('chat', () => {
     const running = await checkBridgeRunning()
     if (running) {
       bridgeStatus.value = 'running'
+      enforceOverlayExclusive('right')
       showTerminalSidebar.value = true
     } else {
       bridgeStatus.value = 'not_running'
@@ -2196,6 +2268,7 @@ export const useChatStore = defineStore('chat', () => {
   }
 
   function openTerminalSidebar() {
+    enforceOverlayExclusive('right')
     showTerminalSidebar.value = true
   }
 
@@ -3753,13 +3826,19 @@ export const useChatStore = defineStore('chat', () => {
     diagnosticStage,
     // 日志收集（HCI 侧 acli log_collect）
     logCollectVisible,
-    // 工作区三栏布局（中央 / 左抽屉 / 右终端）
+    // 工作区三栏布局（中央 / 左面板 / 右面板）
     viewportWidth,
     workspaceLayout,
     leftPanelWidth,
     rightPanelWidth,
     isLeftPanelOpen,
     isRightPanelOpen,
+    leftPanelTab,
+    collapseLeftPanel,
+    showTerminalReplay,
+    terminalReplayCaseId,
+    openTerminalReplay,
+    closeTerminalReplay,
     setViewportWidth,
     setLeftPanelPreferred,
     setRightPanelPreferred,
