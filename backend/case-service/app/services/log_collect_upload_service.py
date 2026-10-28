@@ -338,6 +338,10 @@ class LogCollectUploadService:
         task.archive_path = object_key
         task.archive_size = size
         task.archive_sha256 = digest
+        # 平台对象单独留索引：archive_* 在 P1 是节点路径，不能用来判断"平台有没有留包"。
+        task.object_key = object_key
+        task.object_size = size
+        task.object_sha256 = digest
         await self.repository.flush()
         await self.repository.refresh(task)
 
