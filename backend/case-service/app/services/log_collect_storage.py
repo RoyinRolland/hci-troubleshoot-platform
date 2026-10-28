@@ -324,10 +324,8 @@ class LocalLogCollectStorage:
         if meta is None:
             return
         meta["merged"] = {"size": size, "sha256": digest}
-        try:
+        with contextlib.suppress(OSError):
             self.write_meta(upload_id, meta)
-        except OSError:
-            pass
 
     # ── 清理临时分片 ────────────────────────────────────────────────────────
 
