@@ -51,6 +51,7 @@ def repo():
     repo = MagicMock()
     repo.flush = AsyncMock()
     repo.refresh = AsyncMock()
+    repo.commit = AsyncMock()
     return repo
 
 
@@ -279,6 +280,74 @@ async def test_complete_updates_task_and_cleans_parts(service, repo, storage):
     assert repo.flush.await_count == 1
     # 临时分片已清理
     assert storage.existing_parts(str(task.task_id)) == []
+
+
+async def test_complete_commits_before_merging(service, repo, storage, monkeypatch):
+    """合并前必须先把读事务提交掉。
+
+    现场 Q2026102800720：complete 在同一个事务里合并 3.6 GiB（~50s），
+    连接级 idle_in_transaction_session_timeout=30s 把连接 terminate 了，
+    随后 flush 报 "connection is closed" → 500，包已合并却在库里查不到。
+    这条断言锁的是顺序：merge 被调用时，commit 必须已经发生过。
+    """
+    task, total, _sha = make_task()
+    await service.init(task, total_size=total, expected_sha256=None)
+    payload = b"12345678" + b"9abcdefg" + b"hijk"
+    for index, start in enumerate((0, CHUNK, 2 * CHUNK), start=1):
+        await service.record_part(
+            task.task_id,
+            part_number=index,
+            chunks=chunks_of(payload[start : start + CHUNK]),
+            claimed_sha256=None,
+        )
+
+    observed: list[int] = []
+    original_merge = storage.merge
+
+    async def spy_merge(**kwargs):
+        observed.append(repo.commit.await_count)
+        return await original_merge(**kwargs)
+
+    monkeypatch.setattr(storage, "merge", spy_merge)
+
+    await service.complete(task, parts=None, declared_sha256=None, declared_size=None)
+
+    assert observed == [1], "合并发生时事务必须已经提交（否则会被 30s 空闲超时杀掉）"
+    assert repo.commit.await_count == 1
+
+
+async def test_complete_retry_reuses_merged_object(service, repo, storage):
+    """落库失败后重试不得重写整包。
+
+    现场同一条任务重试了 4 次，每次都把 3.6 GiB 重新合并一遍——峰值磁盘翻倍、
+    每次又都超过 30s，重试注定原地打转。合并成功即落 marker，重试直接复用。
+    """
+    task, total, _sha = make_task()
+    await service.init(task, total_size=total, expected_sha256=None)
+    payload = b"12345678" + b"9abcdefg" + b"hijk"
+    for index, start in enumerate((0, CHUNK, 2 * CHUNK), start=1):
+        await service.record_part(
+            task.task_id,
+            part_number=index,
+            chunks=chunks_of(payload[start : start + CHUNK]),
+            claimed_sha256=None,
+        )
+
+    # 第一次：合并成功，随后落库失败（模拟连接已被 PG 杀掉）
+    repo.flush.side_effect = RuntimeError("connection is closed")
+    with pytest.raises(RuntimeError):
+        await service.complete(task, parts=None, declared_sha256=None, declared_size=None)
+    repo.flush.side_effect = None
+
+    target = storage.object_path(task.case_id, str(task.task_id))
+    assert target.is_file(), "合并成品应已落盘（这正是现场的真实状态）"
+    first_mtime = target.stat().st_mtime_ns
+
+    result = await service.complete(task, parts=None, declared_sha256=None, declared_size=None)
+
+    assert result["sha256"] == hashlib.sha256(payload).hexdigest()
+    assert target.stat().st_mtime_ns == first_mtime, "重试应复用成品，而不是重写一遍"
+    assert task.archive_sha256 == result["sha256"]
 
 
 async def test_complete_rejects_missing_parts(service):
